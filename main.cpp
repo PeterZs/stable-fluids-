@@ -1,9 +1,7 @@
-#include "stable_fluids.h"
-
-#include <cuda_runtime.h>
-
+#include "src/stable_fluids.h"
 #include <algorithm>
 #include <cstdlib>
+#include <cuda_runtime.h>
 #include <iostream>
 #include <numeric>
 #include <vector>

@@ -18,23 +18,21 @@ set(CMAKE_CUDA_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
+set(CMAKE_CUDA_ARCHITECTURES native)
 
 # ============================================================================
 # Targets
 # ============================================================================
 add_library(
-    stable-fluids
-    SHARED
-    stable_fluids.h
-    solver.cu
+        stable-fluids
+        SHARED
+        src/stable_fluids.h
+        src/solver.cu
 )
 
 add_executable(
-    stable-fluids-app
-    main.cpp
+        stable-fluids-app
+        main.cpp
 )
 
 target_compile_features(stable-fluids PRIVATE cxx_std_23)
@@ -51,17 +49,17 @@ target_link_libraries(stable-fluids-app PRIVATE stable-fluids CUDA::cudart)
 # ============================================================================
 # Compile Options
 # ============================================================================
-if(MSVC)
+if (MSVC)
     target_compile_options(stable-fluids PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive->)
     target_compile_options(stable-fluids-app PRIVATE /W4 /permissive-)
-else()
+else ()
     target_compile_options(stable-fluids PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
     target_compile_options(stable-fluids-app PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+endif ()
 
 target_compile_options(
-    stable-fluids
-    PRIVATE
+        stable-fluids
+        PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>
 )
 
@@ -69,8 +67,8 @@ target_compile_options(
 # CUDA Linking
 # ============================================================================
 set_target_properties(
-    stable-fluids
-    PROPERTIES
+        stable-fluids
+        PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
@@ -78,26 +76,26 @@ set_target_properties(
 # ============================================================================
 # Output Layout
 # ============================================================================
-foreach(target stable-fluids stable-fluids-app)
+foreach (target stable-fluids stable-fluids-app)
     set_target_properties(
-        ${target}
-        PROPERTIES
+            ${target}
+            PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
             LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
             ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     )
-endforeach()
+endforeach ()
 
 # ============================================================================
 # Runtime Lookup
 # ============================================================================
-if(UNIX)
-    foreach(target stable-fluids stable-fluids-app)
+if (UNIX)
+    foreach (target stable-fluids stable-fluids-app)
         set_target_properties(
-            ${target}
-            PROPERTIES
+                ${target}
+                PROPERTIES
                 BUILD_RPATH "$ORIGIN"
                 INSTALL_RPATH "$ORIGIN"
         )
-    endforeach()
-endif()
+    endforeach ()
+endif ()

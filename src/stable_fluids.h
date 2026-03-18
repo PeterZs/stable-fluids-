@@ -14,13 +14,13 @@
 #define STABLE_FLUIDS_API
 #endif
 
-#define STABLE_FLUIDS_SUCCESS 0
-#define STABLE_FLUIDS_ERROR_INVALID_ARGUMENT -1
-#define STABLE_FLUIDS_ERROR_RUNTIME -2
+#define STABLE_FLUIDS_SUCCESS                 0
+#define STABLE_FLUIDS_ERROR_INVALID_ARGUMENT  -1
+#define STABLE_FLUIDS_ERROR_RUNTIME           -2
 #define STABLE_FLUIDS_ERROR_ALLOCATION_FAILED -3
-#define STABLE_FLUIDS_ERROR_BUFFER_TOO_SMALL -4
+#define STABLE_FLUIDS_ERROR_BUFFER_TOO_SMALL  -4
 
-#define STABLE_FLUIDS_BUFFER_FORMAT_F32 1u
+#define STABLE_FLUIDS_BUFFER_FORMAT_F32       1u
 #define STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE 1u
 
 #ifdef __cplusplus
@@ -86,28 +86,15 @@ STABLE_FLUIDS_API void stable_fluids_context_destroy(StableFluidsContext* contex
 STABLE_FLUIDS_API uint64_t stable_fluids_context_required_elements(const StableFluidsContext* context);
 STABLE_FLUIDS_API uint64_t stable_fluids_context_required_scalar_field_bytes(const StableFluidsContext* context);
 
-STABLE_FLUIDS_API int32_t stable_fluids_fields_clear(
-    StableFluidsContext* context,
-    const StableFluidsFieldSetDesc* fields);
-STABLE_FLUIDS_API int32_t stable_fluids_fields_step(
-    StableFluidsContext* context,
-    const StableFluidsFieldSetDesc* fields);
-STABLE_FLUIDS_API int32_t stable_fluids_fields_add_density_splat(
-    StableFluidsContext* context,
-    const StableFluidsFieldSetDesc* fields,
-    const StableFluidsDensitySplatDesc* splat);
-STABLE_FLUIDS_API int32_t stable_fluids_fields_add_force_splat(
-    StableFluidsContext* context,
-    const StableFluidsFieldSetDesc* fields,
-    const StableFluidsForceSplatDesc* splat);
+STABLE_FLUIDS_API int32_t stable_fluids_fields_clear(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields);
+STABLE_FLUIDS_API int32_t stable_fluids_fields_step(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields);
+STABLE_FLUIDS_API int32_t stable_fluids_fields_add_density_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat);
+STABLE_FLUIDS_API int32_t stable_fluids_fields_add_force_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat);
 
 STABLE_FLUIDS_API uint64_t stable_fluids_last_error_length(void);
 STABLE_FLUIDS_API uint64_t stable_fluids_context_last_error_length(const StableFluidsContext* context);
 STABLE_FLUIDS_API int32_t stable_fluids_copy_last_error(char* buffer, uint64_t buffer_size);
-STABLE_FLUIDS_API int32_t stable_fluids_copy_context_last_error(
-    const StableFluidsContext* context,
-    char* buffer,
-    uint64_t buffer_size);
+STABLE_FLUIDS_API int32_t stable_fluids_copy_context_last_error(const StableFluidsContext* context, char* buffer, uint64_t buffer_size);
 
 #ifdef __cplusplus
 }
