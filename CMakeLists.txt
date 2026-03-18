@@ -26,8 +26,8 @@ set(CMAKE_CUDA_ARCHITECTURES native)
 add_library(
         stable-fluids
         SHARED
-        include/stable_fluids.h
-        src/solver.cu
+        stable_fluids.h
+        solver.cu
 )
 
 add_executable(
@@ -35,14 +35,9 @@ add_executable(
         main.cpp
 )
 
-target_compile_features(stable-fluids PRIVATE cxx_std_23)
-target_compile_features(stable-fluids-app PRIVATE cxx_std_23)
-
 target_compile_definitions(stable-fluids PRIVATE STABLE_FLUIDS_BUILD_SHARED)
-
-target_include_directories(stable-fluids PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
 target_link_libraries(stable-fluids PRIVATE CUDA::cudart)
+
 target_link_libraries(stable-fluids-app PRIVATE stable-fluids CUDA::cudart)
 
 # ============================================================================

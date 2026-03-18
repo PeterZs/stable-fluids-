@@ -15,6 +15,7 @@ namespace stable_fluids {
     using FieldSet     = StableFluidsFieldSetDesc;
     using DensitySplat = StableFluidsDensitySplatDesc;
     using ForceSplat   = StableFluidsForceSplatDesc;
+    using Stream       = cudaStream_t;
 
     namespace {
 
@@ -264,6 +265,24 @@ namespace stable_fluids {
                 half_inv_h * ((u[ghosted_index(i + 1, j, k, nx_total, ny_total)] - u[ghosted_index(i - 1, j, k, nx_total, ny_total)]) + (v[ghosted_index(i, j + 1, k, nx_total, ny_total)] - v[ghosted_index(i, j - 1, k, nx_total, ny_total)]) + (w[ghosted_index(i, j, k + 1, nx_total, ny_total)] - w[ghosted_index(i, j, k - 1, nx_total, ny_total)]));
         }
 
+        __global__ void rbgs_pressure_kernel(float* pressure, const float* divergence, float h2, int parity, int nx, int ny, int nz, int nx_total, int ny_total) {
+            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
+            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
+            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
+            if (i > nx || j > ny || k > nz || ((i + j + k) & 1) != parity) {
+                return;
+            }
+
+            const int idx         = ghosted_index(i, j, k, nx_total, ny_total);
+            const float neighbors = pressure[ghosted_index(i - 1, j, k, nx_total, ny_total)] +
+                                    pressure[ghosted_index(i + 1, j, k, nx_total, ny_total)] +
+                                    pressure[ghosted_index(i, j - 1, k, nx_total, ny_total)] +
+                                    pressure[ghosted_index(i, j + 1, k, nx_total, ny_total)] +
+                                    pressure[ghosted_index(i, j, k - 1, nx_total, ny_total)] +
+                                    pressure[ghosted_index(i, j, k + 1, nx_total, ny_total)];
+            pressure[idx]         = (neighbors - divergence[idx] * h2) / 6.0f;
+        }
+
         __global__ void subtract_gradient_kernel(float* u, float* v, float* w, const float* pressure, float half_inv_h, int nx, int ny, int nz, int nx_total, int ny_total) {
             const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
             const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
@@ -276,80 +295,6 @@ namespace stable_fluids {
             u[idx] -= half_inv_h * (pressure[ghosted_index(i + 1, j, k, nx_total, ny_total)] - pressure[ghosted_index(i - 1, j, k, nx_total, ny_total)]);
             v[idx] -= half_inv_h * (pressure[ghosted_index(i, j + 1, k, nx_total, ny_total)] - pressure[ghosted_index(i, j - 1, k, nx_total, ny_total)]);
             w[idx] -= half_inv_h * (pressure[ghosted_index(i, j, k + 1, nx_total, ny_total)] - pressure[ghosted_index(i, j, k - 1, nx_total, ny_total)]);
-        }
-
-        __global__ void pcg_initialize_kernel(float* pressure, float* r, float* z, float* p, const float* divergence, float diag_inv, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) {
-                return;
-            }
-
-            const int idx = ghosted_index(i, j, k, nx_total, ny_total);
-            pressure[idx] = 0.0f;
-            r[idx]        = -divergence[idx];
-            z[idx]        = diag_inv * r[idx];
-            p[idx]        = z[idx];
-        }
-
-        __global__ void pcg_apply_preconditioner_kernel(float* z, const float* r, float diag_inv, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) {
-                return;
-            }
-
-            z[ghosted_index(i, j, k, nx_total, ny_total)] = diag_inv * r[ghosted_index(i, j, k, nx_total, ny_total)];
-        }
-
-        __global__ void pressure_matvec_kernel(float* ap, const float* p, float inv_h2, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) {
-                return;
-            }
-
-            const int idx         = ghosted_index(i, j, k, nx_total, ny_total);
-            const float center    = 6.0f * inv_h2 * p[idx];
-            const float neighbors = inv_h2 * (p[ghosted_index(i - 1, j, k, nx_total, ny_total)] + p[ghosted_index(i + 1, j, k, nx_total, ny_total)] + p[ghosted_index(i, j - 1, k, nx_total, ny_total)] + p[ghosted_index(i, j + 1, k, nx_total, ny_total)] + p[ghosted_index(i, j, k - 1, nx_total, ny_total)] + p[ghosted_index(i, j, k + 1, nx_total, ny_total)]);
-            ap[idx]               = center - neighbors;
-        }
-
-        __global__ void axpy_kernel(float* y, const float* x, float alpha, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) {
-                return;
-            }
-
-            y[ghosted_index(i, j, k, nx_total, ny_total)] += alpha * x[ghosted_index(i, j, k, nx_total, ny_total)];
-        }
-
-        __global__ void residual_update_kernel(float* r, const float* ap, float alpha, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) {
-                return;
-            }
-
-            r[ghosted_index(i, j, k, nx_total, ny_total)] -= alpha * ap[ghosted_index(i, j, k, nx_total, ny_total)];
-        }
-
-        __global__ void direction_update_kernel(float* p, const float* z, float beta, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) {
-                return;
-            }
-
-            const int idx = ghosted_index(i, j, k, nx_total, ny_total);
-            p[idx]        = z[idx] + beta * p[idx];
         }
 
         __global__ void dot_kernel(const float* lhs, const float* rhs, float* output, int nx, int ny, int nz, int nx_total, int ny_total) {
@@ -380,23 +325,28 @@ namespace stable_fluids {
         [[nodiscard]] std::uint64_t required_scalar_field_bytes() const noexcept;
 
         void zero_fields(const FieldSet& fields);
+        void zero_fields_async(const FieldSet& fields, Stream stream);
         void add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount);
+        void add_density_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream);
         void add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz);
+        void add_force_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream);
         void step(const FieldSet& fields);
+        void step_async(const FieldSet& fields, Stream stream);
+        void snapshot_density_async(const FieldSet& fields, const BufferView& destination, Stream stream);
 
     private:
         void validate_fields_(const FieldSet& fields) const;
-        void fill_field_(float* field, float value);
-        void zero_compact_field_(float* field);
-        void copy_compact_to_ghosted_(float* ghosted, const float* compact);
-        void copy_ghosted_to_compact_(float* compact, const float* ghosted);
-        float dot_interior_(const float* lhs, const float* rhs);
-        void set_boundary_(int field_kind, float* field);
-        void advect_scalar_(float* dst, const float* src, const float* u, const float* v, const float* w);
-        void advect_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel);
-        void diffuse_scalar_(float* dst, const float* src);
-        void diffuse_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src);
-        void project_(float* u, float* v, float* w);
+        void fill_field_(float* field, float value, Stream stream);
+        void zero_compact_field_(float* field, Stream stream);
+        void copy_compact_to_ghosted_(float* ghosted, const float* compact, Stream stream);
+        void copy_ghosted_to_compact_(float* compact, const float* ghosted, Stream stream);
+        float dot_interior_(const float* lhs, const float* rhs, Stream stream);
+        void set_boundary_(int field_kind, float* field, Stream stream);
+        void advect_scalar_(float* dst, const float* src, const float* u, const float* v, const float* w, Stream stream);
+        void advect_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel, Stream stream);
+        void diffuse_scalar_(float* dst, const float* src, Stream stream);
+        void diffuse_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, Stream stream);
+        void project_(float* u, float* v, float* w, Stream stream);
 
         SolverDesc desc_{};
         std::size_t interior_cell_count_ = 0;
@@ -461,20 +411,20 @@ namespace stable_fluids {
         allocate(pcg_ap_);
         check_cuda(cudaMalloc(reinterpret_cast<void**>(&reduction_), sizeof(float)), "cudaMalloc reduction");
 
-        fill_field_(density_, 0.0f);
-        fill_field_(u_, 0.0f);
-        fill_field_(v_, 0.0f);
-        fill_field_(w_, 0.0f);
-        fill_field_(density_prev_, 0.0f);
-        fill_field_(u_prev_, 0.0f);
-        fill_field_(v_prev_, 0.0f);
-        fill_field_(w_prev_, 0.0f);
-        fill_field_(pressure_, 0.0f);
-        fill_field_(divergence_, 0.0f);
-        fill_field_(pcg_r_, 0.0f);
-        fill_field_(pcg_z_, 0.0f);
-        fill_field_(pcg_p_, 0.0f);
-        fill_field_(pcg_ap_, 0.0f);
+        fill_field_(density_, 0.0f, nullptr);
+        fill_field_(u_, 0.0f, nullptr);
+        fill_field_(v_, 0.0f, nullptr);
+        fill_field_(w_, 0.0f, nullptr);
+        fill_field_(density_prev_, 0.0f, nullptr);
+        fill_field_(u_prev_, 0.0f, nullptr);
+        fill_field_(v_prev_, 0.0f, nullptr);
+        fill_field_(w_prev_, 0.0f, nullptr);
+        fill_field_(pressure_, 0.0f, nullptr);
+        fill_field_(divergence_, 0.0f, nullptr);
+        fill_field_(pcg_r_, 0.0f, nullptr);
+        fill_field_(pcg_z_, 0.0f, nullptr);
+        fill_field_(pcg_p_, 0.0f, nullptr);
+        fill_field_(pcg_ap_, 0.0f, nullptr);
         check_cuda(cudaDeviceSynchronize(), "constructor synchronize");
     }
 
@@ -526,258 +476,262 @@ namespace stable_fluids {
         validate_buffer(fields.velocity_z, "velocity_z");
     }
 
-    void Solver3D::fill_field_(float* field, float value) {
+    void Solver3D::fill_field_(float* field, float value, Stream stream) {
         constexpr int block_size = 256;
         const int grid_size      = static_cast<int>((total_cell_count_ + block_size - 1) / block_size);
-        fill_kernel<<<grid_size, block_size>>>(field, value, total_cell_count_);
+        fill_kernel<<<grid_size, block_size, 0, stream>>>(field, value, total_cell_count_);
         check_cuda(cudaGetLastError(), "fill_kernel launch");
     }
 
-    void Solver3D::zero_compact_field_(float* field) {
+    void Solver3D::zero_compact_field_(float* field, Stream stream) {
         constexpr int block_size = 256;
         const int grid_size      = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
-        zero_compact_field_kernel<<<grid_size, block_size>>>(field, interior_cell_count_);
+        zero_compact_field_kernel<<<grid_size, block_size, 0, stream>>>(field, interior_cell_count_);
         check_cuda(cudaGetLastError(), "zero_compact_field_kernel launch");
     }
 
-    void Solver3D::copy_compact_to_ghosted_(float* ghosted, const float* compact) {
+    void Solver3D::copy_compact_to_ghosted_(float* ghosted, const float* compact, Stream stream) {
         constexpr int block_size = 256;
         const int grid_size      = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
-        copy_compact_to_ghosted_kernel<<<grid_size, block_size>>>(ghosted, compact, desc_.nx, desc_.ny, nx_total_, ny_total_, interior_cell_count_);
+        copy_compact_to_ghosted_kernel<<<grid_size, block_size, 0, stream>>>(ghosted, compact, desc_.nx, desc_.ny, nx_total_, ny_total_, interior_cell_count_);
         check_cuda(cudaGetLastError(), "copy_compact_to_ghosted_kernel launch");
     }
 
-    void Solver3D::copy_ghosted_to_compact_(float* compact, const float* ghosted) {
+    void Solver3D::copy_ghosted_to_compact_(float* compact, const float* ghosted, Stream stream) {
         constexpr int block_size = 256;
         const int grid_size      = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
-        copy_ghosted_to_compact_kernel<<<grid_size, block_size>>>(compact, ghosted, desc_.nx, desc_.ny, nx_total_, ny_total_, interior_cell_count_);
+        copy_ghosted_to_compact_kernel<<<grid_size, block_size, 0, stream>>>(compact, ghosted, desc_.nx, desc_.ny, nx_total_, ny_total_, interior_cell_count_);
         check_cuda(cudaGetLastError(), "copy_ghosted_to_compact_kernel launch");
     }
 
-    float Solver3D::dot_interior_(const float* lhs, const float* rhs) {
-        check_cuda(cudaMemset(reduction_, 0, sizeof(float)), "cudaMemset reduction");
+    float Solver3D::dot_interior_(const float* lhs, const float* rhs, Stream stream) {
+        check_cuda(cudaMemsetAsync(reduction_, 0, sizeof(float), stream), "cudaMemsetAsync reduction");
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        dot_kernel<<<grid, block>>>(lhs, rhs, reduction_, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+        dot_kernel<<<grid, block, 0, stream>>>(lhs, rhs, reduction_, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
         check_cuda(cudaGetLastError(), "dot_kernel launch");
 
         float result = 0.0f;
-        check_cuda(cudaMemcpy(&result, reduction_, sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy reduction to host");
+        check_cuda(cudaMemcpyAsync(&result, reduction_, sizeof(float), cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync reduction to host");
+        check_cuda(cudaStreamSynchronize(stream), "dot_interior stream synchronize");
         return result;
     }
 
-    void Solver3D::set_boundary_(int field_kind, float* field) {
+    void Solver3D::set_boundary_(int field_kind, float* field, Stream stream) {
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(nx_total_, ny_total_, nz_total_, block);
-        set_boundary_kernel<<<grid, block>>>(field_kind, field, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+        set_boundary_kernel<<<grid, block, 0, stream>>>(field_kind, field, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
         check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
     }
 
     void Solver3D::zero_fields(const FieldSet& fields) {
+        zero_fields_async(fields, nullptr);
+        check_cuda(cudaStreamSynchronize(nullptr), "zero_fields synchronize");
+    }
+
+    void Solver3D::zero_fields_async(const FieldSet& fields, Stream stream) {
         validate_fields_(fields);
-        zero_compact_field_(reinterpret_cast<float*>(fields.density.data));
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_x.data));
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_y.data));
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_z.data));
-        check_cuda(cudaDeviceSynchronize(), "zero_fields synchronize");
+        zero_compact_field_(reinterpret_cast<float*>(fields.density.data), stream);
+        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_x.data), stream);
+        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_y.data), stream);
+        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_z.data), stream);
     }
 
     void Solver3D::add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount) {
+        add_density_sphere_async(fields, x, y, z, radius, amount, nullptr);
+        check_cuda(cudaStreamSynchronize(nullptr), "add_density_sphere synchronize");
+    }
+
+    void Solver3D::add_density_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream) {
         validate_fields_(fields);
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        splat_density_compact_kernel<<<grid, block>>>(reinterpret_cast<float*>(fields.density.data), x, y, z, fmaxf(radius, 1.0f), amount, desc_.nx, desc_.ny, desc_.nz);
+        splat_density_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.density.data), x, y, z, fmaxf(radius, 1.0f), amount, desc_.nx, desc_.ny, desc_.nz);
         check_cuda(cudaGetLastError(), "splat_density_compact_kernel launch");
-        check_cuda(cudaDeviceSynchronize(), "add_density_sphere synchronize");
     }
 
     void Solver3D::add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz) {
+        add_force_sphere_async(fields, x, y, z, radius, fx, fy, fz, nullptr);
+        check_cuda(cudaStreamSynchronize(nullptr), "add_force_sphere synchronize");
+    }
+
+    void Solver3D::add_force_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream) {
         validate_fields_(fields);
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        splat_force_compact_kernel<<<grid, block>>>(reinterpret_cast<float*>(fields.velocity_x.data), reinterpret_cast<float*>(fields.velocity_y.data), reinterpret_cast<float*>(fields.velocity_z.data), x, y, z, fmaxf(radius, 1.0f), fx, fy, fz, desc_.nx, desc_.ny, desc_.nz);
+        splat_force_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.velocity_x.data), reinterpret_cast<float*>(fields.velocity_y.data), reinterpret_cast<float*>(fields.velocity_z.data), x, y, z, fmaxf(radius, 1.0f), fx, fy, fz, desc_.nx, desc_.ny, desc_.nz);
         check_cuda(cudaGetLastError(), "splat_force_compact_kernel launch");
-        check_cuda(cudaDeviceSynchronize(), "add_force_sphere synchronize");
     }
 
-    void Solver3D::advect_scalar_(float* dst, const float* src, const float* u, const float* v, const float* w) {
+    void Solver3D::advect_scalar_(float* dst, const float* src, const float* u, const float* v, const float* w, Stream stream) {
         const dim3 block      = make_block(desc_);
         const dim3 grid       = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
         const float dt_over_h = desc_.dt / desc_.cell_size;
-        advect_scalar_kernel<<<grid, block>>>(dst, src, u, v, w, dt_over_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+        advect_scalar_kernel<<<grid, block, 0, stream>>>(dst, src, u, v, w, dt_over_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
         check_cuda(cudaGetLastError(), "advect_scalar_kernel launch");
-        set_boundary_(0, dst);
+        set_boundary_(0, dst, stream);
     }
 
-    void Solver3D::advect_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel) {
+    void Solver3D::advect_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel, Stream stream) {
         const dim3 block      = make_block(desc_);
         const dim3 grid       = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
         const float dt_over_h = desc_.dt / desc_.cell_size;
-        advect_velocity_kernel<<<grid, block>>>(u_dst, v_dst, w_dst, u_src, v_src, w_src, u_vel, v_vel, w_vel, dt_over_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+        advect_velocity_kernel<<<grid, block, 0, stream>>>(u_dst, v_dst, w_dst, u_src, v_src, w_src, u_vel, v_vel, w_vel, dt_over_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
         check_cuda(cudaGetLastError(), "advect_velocity_kernel launch");
-        set_boundary_(1, u_dst);
-        set_boundary_(2, v_dst);
-        set_boundary_(3, w_dst);
+        set_boundary_(1, u_dst, stream);
+        set_boundary_(2, v_dst, stream);
+        set_boundary_(3, w_dst, stream);
     }
 
-    void Solver3D::diffuse_scalar_(float* dst, const float* src) {
+    void Solver3D::diffuse_scalar_(float* dst, const float* src, Stream stream) {
         if (desc_.diffusion <= 0.0f) {
-            check_cuda(cudaMemcpy(dst, src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy scalar diffuse bypass");
-            set_boundary_(0, dst);
+            check_cuda(cudaMemcpyAsync(dst, src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse bypass");
+            set_boundary_(0, dst, stream);
             return;
         }
 
-        check_cuda(cudaMemcpy(dst, src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy scalar diffuse init");
+        check_cuda(cudaMemcpyAsync(dst, src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse init");
 
         const dim3 block  = make_block(desc_);
         const dim3 grid   = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
         const float alpha = desc_.dt * desc_.diffusion / (desc_.cell_size * desc_.cell_size);
         const float denom = 1.0f + 6.0f * alpha;
 
-        set_boundary_(0, dst);
+        set_boundary_(0, dst, stream);
         for (int iteration = 0; iteration < desc_.diffuse_iterations; ++iteration) {
-            rbgs_diffuse_kernel<<<grid, block>>>(dst, src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(dst, src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
             check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar red launch");
-            set_boundary_(0, dst);
+            set_boundary_(0, dst, stream);
 
-            rbgs_diffuse_kernel<<<grid, block>>>(dst, src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(dst, src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
             check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar black launch");
-            set_boundary_(0, dst);
+            set_boundary_(0, dst, stream);
         }
     }
 
-    void Solver3D::diffuse_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src) {
+    void Solver3D::diffuse_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, Stream stream) {
         if (desc_.viscosity <= 0.0f) {
-            check_cuda(cudaMemcpy(u_dst, u_src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy u diffuse bypass");
-            check_cuda(cudaMemcpy(v_dst, v_src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy v diffuse bypass");
-            check_cuda(cudaMemcpy(w_dst, w_src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy w diffuse bypass");
-            set_boundary_(1, u_dst);
-            set_boundary_(2, v_dst);
-            set_boundary_(3, w_dst);
+            check_cuda(cudaMemcpyAsync(u_dst, u_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse bypass");
+            check_cuda(cudaMemcpyAsync(v_dst, v_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse bypass");
+            check_cuda(cudaMemcpyAsync(w_dst, w_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse bypass");
+            set_boundary_(1, u_dst, stream);
+            set_boundary_(2, v_dst, stream);
+            set_boundary_(3, w_dst, stream);
             return;
         }
 
-        check_cuda(cudaMemcpy(u_dst, u_src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy u diffuse init");
-        check_cuda(cudaMemcpy(v_dst, v_src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy v diffuse init");
-        check_cuda(cudaMemcpy(w_dst, w_src, ghosted_bytes_, cudaMemcpyDeviceToDevice), "cudaMemcpy w diffuse init");
+        check_cuda(cudaMemcpyAsync(u_dst, u_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse init");
+        check_cuda(cudaMemcpyAsync(v_dst, v_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse init");
+        check_cuda(cudaMemcpyAsync(w_dst, w_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse init");
 
         const dim3 block  = make_block(desc_);
         const dim3 grid   = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
         const float alpha = desc_.dt * desc_.viscosity / (desc_.cell_size * desc_.cell_size);
         const float denom = 1.0f + 6.0f * alpha;
 
-        set_boundary_(1, u_dst);
-        set_boundary_(2, v_dst);
-        set_boundary_(3, w_dst);
+        set_boundary_(1, u_dst, stream);
+        set_boundary_(2, v_dst, stream);
+        set_boundary_(3, w_dst, stream);
 
         for (int iteration = 0; iteration < desc_.diffuse_iterations; ++iteration) {
-            rbgs_diffuse_kernel<<<grid, block>>>(u_dst, u_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block>>>(v_dst, v_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block>>>(w_dst, w_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(u_dst, u_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(v_dst, v_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(w_dst, w_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
             check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity red launch");
-            set_boundary_(1, u_dst);
-            set_boundary_(2, v_dst);
-            set_boundary_(3, w_dst);
+            set_boundary_(1, u_dst, stream);
+            set_boundary_(2, v_dst, stream);
+            set_boundary_(3, w_dst, stream);
 
-            rbgs_diffuse_kernel<<<grid, block>>>(u_dst, u_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block>>>(v_dst, v_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block>>>(w_dst, w_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(u_dst, u_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(v_dst, v_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(w_dst, w_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
             check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity black launch");
-            set_boundary_(1, u_dst);
-            set_boundary_(2, v_dst);
-            set_boundary_(3, w_dst);
+            set_boundary_(1, u_dst, stream);
+            set_boundary_(2, v_dst, stream);
+            set_boundary_(3, w_dst, stream);
         }
     }
 
-    void Solver3D::project_(float* u, float* v, float* w) {
+    void Solver3D::project_(float* u, float* v, float* w, Stream stream) {
         const dim3 block       = make_block(desc_);
         const dim3 grid        = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
         const float half_inv_h = 0.5f / desc_.cell_size;
-        const float inv_h2     = 1.0f / (desc_.cell_size * desc_.cell_size);
-        const float diag_inv   = 1.0f / (6.0f * inv_h2);
-        const float tolerance2 = desc_.pressure_tolerance * desc_.pressure_tolerance * static_cast<float>(interior_cell_count_);
+        const float h2         = desc_.cell_size * desc_.cell_size;
 
-        divergence_kernel<<<grid, block>>>(divergence_, u, v, w, half_inv_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+        divergence_kernel<<<grid, block, 0, stream>>>(divergence_, u, v, w, half_inv_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
         check_cuda(cudaGetLastError(), "divergence_kernel launch");
-        set_boundary_(0, divergence_);
+        set_boundary_(0, divergence_, stream);
 
-        fill_field_(pressure_, 0.0f);
-        fill_field_(pcg_r_, 0.0f);
-        fill_field_(pcg_z_, 0.0f);
-        fill_field_(pcg_p_, 0.0f);
-        fill_field_(pcg_ap_, 0.0f);
-
-        pcg_initialize_kernel<<<grid, block>>>(pressure_, pcg_r_, pcg_z_, pcg_p_, divergence_, diag_inv, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-        check_cuda(cudaGetLastError(), "pcg_initialize_kernel launch");
-        set_boundary_(0, pressure_);
-        set_boundary_(0, pcg_p_);
-
-        float rho = dot_interior_(pcg_r_, pcg_z_);
+        fill_field_(pressure_, 0.0f, stream);
+        set_boundary_(0, pressure_, stream);
 
         for (int iteration = 0; iteration < desc_.pressure_iterations; ++iteration) {
-            set_boundary_(0, pcg_p_);
-            pressure_matvec_kernel<<<grid, block>>>(pcg_ap_, pcg_p_, inv_h2, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "pressure_matvec_kernel launch");
+            rbgs_pressure_kernel<<<grid, block, 0, stream>>>(pressure_, divergence_, h2, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            check_cuda(cudaGetLastError(), "rbgs_pressure_kernel red launch");
+            set_boundary_(0, pressure_, stream);
 
-            const float denom = dot_interior_(pcg_p_, pcg_ap_);
-            if (fabsf(denom) < 1.0e-12f) {
-                break;
-            }
-
-            const float alpha = rho / denom;
-            axpy_kernel<<<grid, block>>>(pressure_, pcg_p_, alpha, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            residual_update_kernel<<<grid, block>>>(pcg_r_, pcg_ap_, alpha, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "pcg alpha update launch");
-            set_boundary_(0, pressure_);
-
-            const float residual2 = dot_interior_(pcg_r_, pcg_r_);
-            if (residual2 < tolerance2) {
-                break;
-            }
-
-            pcg_apply_preconditioner_kernel<<<grid, block>>>(pcg_z_, pcg_r_, diag_inv, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "pcg_apply_preconditioner_kernel launch");
-
-            const float rho_new = dot_interior_(pcg_r_, pcg_z_);
-            const float beta    = rho_new / fmaxf(rho, 1.0e-12f);
-            direction_update_kernel<<<grid, block>>>(pcg_p_, pcg_z_, beta, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "direction_update_kernel launch");
-            rho = rho_new;
+            rbgs_pressure_kernel<<<grid, block, 0, stream>>>(pressure_, divergence_, h2, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+            check_cuda(cudaGetLastError(), "rbgs_pressure_kernel black launch");
+            set_boundary_(0, pressure_, stream);
         }
 
-        set_boundary_(0, pressure_);
-        subtract_gradient_kernel<<<grid, block>>>(u, v, w, pressure_, half_inv_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
+        set_boundary_(0, pressure_, stream);
+        subtract_gradient_kernel<<<grid, block, 0, stream>>>(u, v, w, pressure_, half_inv_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
         check_cuda(cudaGetLastError(), "subtract_gradient_kernel launch");
-        set_boundary_(1, u);
-        set_boundary_(2, v);
-        set_boundary_(3, w);
+        set_boundary_(1, u, stream);
+        set_boundary_(2, v, stream);
+        set_boundary_(3, w, stream);
     }
 
     void Solver3D::step(const FieldSet& fields) {
+        step_async(fields, nullptr);
+        check_cuda(cudaStreamSynchronize(nullptr), "step synchronize");
+    }
+
+    void Solver3D::step_async(const FieldSet& fields, Stream stream) {
         validate_fields_(fields);
 
-        copy_compact_to_ghosted_(density_, reinterpret_cast<const float*>(fields.density.data));
-        copy_compact_to_ghosted_(u_, reinterpret_cast<const float*>(fields.velocity_x.data));
-        copy_compact_to_ghosted_(v_, reinterpret_cast<const float*>(fields.velocity_y.data));
-        copy_compact_to_ghosted_(w_, reinterpret_cast<const float*>(fields.velocity_z.data));
+        copy_compact_to_ghosted_(density_, reinterpret_cast<const float*>(fields.density.data), stream);
+        copy_compact_to_ghosted_(u_, reinterpret_cast<const float*>(fields.velocity_x.data), stream);
+        copy_compact_to_ghosted_(v_, reinterpret_cast<const float*>(fields.velocity_y.data), stream);
+        copy_compact_to_ghosted_(w_, reinterpret_cast<const float*>(fields.velocity_z.data), stream);
 
-        set_boundary_(0, density_);
-        set_boundary_(1, u_);
-        set_boundary_(2, v_);
-        set_boundary_(3, w_);
+        set_boundary_(0, density_, stream);
+        set_boundary_(1, u_, stream);
+        set_boundary_(2, v_, stream);
+        set_boundary_(3, w_, stream);
 
-        advect_velocity_(u_prev_, v_prev_, w_prev_, u_, v_, w_, u_, v_, w_);
-        diffuse_velocity_(u_, v_, w_, u_prev_, v_prev_, w_prev_);
-        project_(u_, v_, w_);
+        advect_velocity_(u_prev_, v_prev_, w_prev_, u_, v_, w_, u_, v_, w_, stream);
+        diffuse_velocity_(u_, v_, w_, u_prev_, v_prev_, w_prev_, stream);
+        project_(u_, v_, w_, stream);
 
-        advect_scalar_(density_prev_, density_, u_, v_, w_);
-        diffuse_scalar_(density_, density_prev_);
+        advect_scalar_(density_prev_, density_, u_, v_, w_, stream);
+        diffuse_scalar_(density_, density_prev_, stream);
 
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.density.data), density_);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_x.data), u_);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_y.data), v_);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_z.data), w_);
-        check_cuda(cudaDeviceSynchronize(), "step synchronize");
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.density.data), density_, stream);
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_x.data), u_, stream);
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_y.data), v_, stream);
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_z.data), w_, stream);
+    }
+
+    void Solver3D::snapshot_density_async(const FieldSet& fields, const BufferView& destination, Stream stream) {
+        validate_fields_(fields);
+        if (destination.data == nullptr) {
+            throw std::invalid_argument("snapshot destination must provide a non-null device pointer");
+        }
+        if (destination.format != STABLE_FLUIDS_BUFFER_FORMAT_F32) {
+            throw std::invalid_argument("snapshot destination must use STABLE_FLUIDS_BUFFER_FORMAT_F32");
+        }
+        if (destination.memory_type != STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE) {
+            throw std::invalid_argument("snapshot destination must use STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE");
+        }
+        if (destination.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
+            throw std::invalid_argument("snapshot destination size_bytes is smaller than nx*ny*nz*sizeof(float)");
+        }
+
+        check_cuda(
+            cudaMemcpyAsync(destination.data, fields.density.data, compact_bytes_, cudaMemcpyDeviceToDevice, stream),
+            "cudaMemcpyAsync density snapshot");
     }
 
 } // namespace stable_fluids
@@ -788,6 +742,10 @@ struct StableFluidsContext {
 };
 
 namespace {
+
+    [[nodiscard]] stable_fluids::Stream to_stream(void* cuda_stream) noexcept {
+        return reinterpret_cast<stable_fluids::Stream>(cuda_stream);
+    }
 
     void set_global_error(const char* message) {
         stable_fluids::g_last_error = message != nullptr ? message : "unknown stable-fluids error";
@@ -884,11 +842,25 @@ int32_t stable_fluids_fields_clear(StableFluidsContext* context, const StableFlu
     return stable_fluids_try(context, [&] { context->solver->zero_fields(*fields); });
 }
 
+int32_t stable_fluids_fields_clear_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream) {
+    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
+        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_clear_async received a null argument");
+    }
+    return stable_fluids_try(context, [&] { context->solver->zero_fields_async(*fields, to_stream(cuda_stream)); });
+}
+
 int32_t stable_fluids_fields_step(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_step received a null argument");
     }
     return stable_fluids_try(context, [&] { context->solver->step(*fields); });
+}
+
+int32_t stable_fluids_fields_step_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream) {
+    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
+        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_step_async received a null argument");
+    }
+    return stable_fluids_try(context, [&] { context->solver->step_async(*fields, to_stream(cuda_stream)); });
 }
 
 int32_t stable_fluids_fields_add_density_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat) {
@@ -898,11 +870,32 @@ int32_t stable_fluids_fields_add_density_splat(StableFluidsContext* context, con
     return stable_fluids_try(context, [&] { context->solver->add_density_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->amount); });
 }
 
+int32_t stable_fluids_fields_add_density_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat, void* cuda_stream) {
+    if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
+        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_density_splat_async received a null argument");
+    }
+    return stable_fluids_try(context, [&] { context->solver->add_density_sphere_async(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->amount, to_stream(cuda_stream)); });
+}
+
 int32_t stable_fluids_fields_add_force_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_force_splat received a null argument");
     }
     return stable_fluids_try(context, [&] { context->solver->add_force_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->force_x, splat->force_y, splat->force_z); });
+}
+
+int32_t stable_fluids_fields_add_force_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat, void* cuda_stream) {
+    if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
+        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_force_splat_async received a null argument");
+    }
+    return stable_fluids_try(context, [&] { context->solver->add_force_sphere_async(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->force_x, splat->force_y, splat->force_z, to_stream(cuda_stream)); });
+}
+
+int32_t stable_fluids_fields_snapshot_density_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, StableFluidsBufferView destination, void* cuda_stream) {
+    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
+        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_snapshot_density_async received a null argument");
+    }
+    return stable_fluids_try(context, [&] { context->solver->snapshot_density_async(*fields, destination, to_stream(cuda_stream)); });
 }
 
 uint64_t stable_fluids_last_error_length(void) {

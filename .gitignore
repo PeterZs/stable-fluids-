@@ -1,8 +1,0 @@
-.idea
-.venv
-cmake-build-*
-build-*
-build*
-data/
-AGENTS.md
-rebuild.bat
