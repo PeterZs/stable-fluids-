@@ -32,11 +32,15 @@ jobs:
                       pacman -Syu --noconfirm
                       pacman -S --noconfirm --needed base-devel git python python-pip cuda
                       python -m pip install --break-system-packages cmake==4.1.2 ninja==1.13.0
-                      export PATH="/usr/local/bin:/root/.local/bin:${PATH}"
+                      export CUDA_PATH=/opt/cuda
+                      export CUDAToolkit_ROOT=/opt/cuda
+                      export PATH="/opt/cuda/bin:/usr/local/bin:/root/.local/bin:${PATH}"
+                      export LD_LIBRARY_PATH="/opt/cuda/lib64:${LD_LIBRARY_PATH:-}"
                       cmake --version
                       ninja --version
+                      test -x /opt/cuda/bin/nvcc
                       nvcc --version
-                      cmake -S . -B '"${BUILD_DIR}"' -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES='"${CUDA_ARCHITECTURES}"'
+                      cmake -S . -B '"${BUILD_DIR}"' -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES='"${CUDA_ARCHITECTURES}"' -DCUDAToolkit_ROOT=/opt/cuda
                       cmake --build '"${BUILD_DIR}"' --parallel
                       chown -R "${HOST_UID}:${HOST_GID}" '"${BUILD_DIR}"'
                     '

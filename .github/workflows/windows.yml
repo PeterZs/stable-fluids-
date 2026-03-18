@@ -13,7 +13,7 @@ jobs:
         runs-on: windows-2022
         env:
             BUILD_DIR: build-windows
-            CUDA_VERSION: 13.2.0
+            CUDA_VERSION: 13.1.0
             CUDA_ARCHITECTURES: 75
         steps:
             - name: Checkout
