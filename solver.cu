@@ -297,18 +297,6 @@ namespace stable_fluids {
             w[idx] -= half_inv_h * (pressure[ghosted_index(i, j, k + 1, nx_total, ny_total)] - pressure[ghosted_index(i, j, k - 1, nx_total, ny_total)]);
         }
 
-        __global__ void dot_kernel(const float* lhs, const float* rhs, float* output, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) {
-                return;
-            }
-
-            const int idx = ghosted_index(i, j, k, nx_total, ny_total);
-            atomicAdd(output, lhs[idx] * rhs[idx]);
-        }
-
     } // namespace
 
     class Solver3D {
@@ -324,15 +312,11 @@ namespace stable_fluids {
         [[nodiscard]] std::uint64_t required_elements() const noexcept;
         [[nodiscard]] std::uint64_t required_scalar_field_bytes() const noexcept;
 
-        void zero_fields(const FieldSet& fields);
-        void zero_fields_async(const FieldSet& fields, Stream stream);
-        void add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount);
-        void add_density_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream);
-        void add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz);
-        void add_force_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream);
-        void step(const FieldSet& fields);
-        void step_async(const FieldSet& fields, Stream stream);
-        void snapshot_density_async(const FieldSet& fields, const BufferView& destination, Stream stream);
+        void zero_fields(const FieldSet& fields, Stream stream);
+        void add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream);
+        void add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream);
+        void step(const FieldSet& fields, Stream stream);
+        void snapshot_density(const FieldSet& fields, const BufferView& destination, Stream stream);
 
     private:
         void validate_fields_(const FieldSet& fields) const;
@@ -340,7 +324,6 @@ namespace stable_fluids {
         void zero_compact_field_(float* field, Stream stream);
         void copy_compact_to_ghosted_(float* ghosted, const float* compact, Stream stream);
         void copy_ghosted_to_compact_(float* compact, const float* ghosted, Stream stream);
-        float dot_interior_(const float* lhs, const float* rhs, Stream stream);
         void set_boundary_(int field_kind, float* field, Stream stream);
         void advect_scalar_(float* dst, const float* src, const float* u, const float* v, const float* w, Stream stream);
         void advect_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel, Stream stream);
@@ -367,11 +350,6 @@ namespace stable_fluids {
         float* w_prev_       = nullptr;
         float* pressure_     = nullptr;
         float* divergence_   = nullptr;
-        float* pcg_r_        = nullptr;
-        float* pcg_z_        = nullptr;
-        float* pcg_p_        = nullptr;
-        float* pcg_ap_       = nullptr;
-        float* reduction_    = nullptr;
     };
 
     Solver3D::Solver3D(const SolverDesc& desc) : desc_(desc) {
@@ -405,11 +383,6 @@ namespace stable_fluids {
         allocate(w_prev_);
         allocate(pressure_);
         allocate(divergence_);
-        allocate(pcg_r_);
-        allocate(pcg_z_);
-        allocate(pcg_p_);
-        allocate(pcg_ap_);
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&reduction_), sizeof(float)), "cudaMalloc reduction");
 
         fill_field_(density_, 0.0f, nullptr);
         fill_field_(u_, 0.0f, nullptr);
@@ -421,10 +394,6 @@ namespace stable_fluids {
         fill_field_(w_prev_, 0.0f, nullptr);
         fill_field_(pressure_, 0.0f, nullptr);
         fill_field_(divergence_, 0.0f, nullptr);
-        fill_field_(pcg_r_, 0.0f, nullptr);
-        fill_field_(pcg_z_, 0.0f, nullptr);
-        fill_field_(pcg_p_, 0.0f, nullptr);
-        fill_field_(pcg_ap_, 0.0f, nullptr);
         check_cuda(cudaDeviceSynchronize(), "constructor synchronize");
     }
 
@@ -439,11 +408,6 @@ namespace stable_fluids {
         cudaFree(w_prev_);
         cudaFree(pressure_);
         cudaFree(divergence_);
-        cudaFree(pcg_r_);
-        cudaFree(pcg_z_);
-        cudaFree(pcg_p_);
-        cudaFree(pcg_ap_);
-        cudaFree(reduction_);
     }
 
     std::uint64_t Solver3D::required_elements() const noexcept {
@@ -504,19 +468,6 @@ namespace stable_fluids {
         check_cuda(cudaGetLastError(), "copy_ghosted_to_compact_kernel launch");
     }
 
-    float Solver3D::dot_interior_(const float* lhs, const float* rhs, Stream stream) {
-        check_cuda(cudaMemsetAsync(reduction_, 0, sizeof(float), stream), "cudaMemsetAsync reduction");
-        const dim3 block = make_block(desc_);
-        const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        dot_kernel<<<grid, block, 0, stream>>>(lhs, rhs, reduction_, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-        check_cuda(cudaGetLastError(), "dot_kernel launch");
-
-        float result = 0.0f;
-        check_cuda(cudaMemcpyAsync(&result, reduction_, sizeof(float), cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync reduction to host");
-        check_cuda(cudaStreamSynchronize(stream), "dot_interior stream synchronize");
-        return result;
-    }
-
     void Solver3D::set_boundary_(int field_kind, float* field, Stream stream) {
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(nx_total_, ny_total_, nz_total_, block);
@@ -524,12 +475,7 @@ namespace stable_fluids {
         check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
     }
 
-    void Solver3D::zero_fields(const FieldSet& fields) {
-        zero_fields_async(fields, nullptr);
-        check_cuda(cudaStreamSynchronize(nullptr), "zero_fields synchronize");
-    }
-
-    void Solver3D::zero_fields_async(const FieldSet& fields, Stream stream) {
+    void Solver3D::zero_fields(const FieldSet& fields, Stream stream) {
         validate_fields_(fields);
         zero_compact_field_(reinterpret_cast<float*>(fields.density.data), stream);
         zero_compact_field_(reinterpret_cast<float*>(fields.velocity_x.data), stream);
@@ -537,12 +483,7 @@ namespace stable_fluids {
         zero_compact_field_(reinterpret_cast<float*>(fields.velocity_z.data), stream);
     }
 
-    void Solver3D::add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount) {
-        add_density_sphere_async(fields, x, y, z, radius, amount, nullptr);
-        check_cuda(cudaStreamSynchronize(nullptr), "add_density_sphere synchronize");
-    }
-
-    void Solver3D::add_density_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream) {
+    void Solver3D::add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream) {
         validate_fields_(fields);
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
@@ -550,12 +491,7 @@ namespace stable_fluids {
         check_cuda(cudaGetLastError(), "splat_density_compact_kernel launch");
     }
 
-    void Solver3D::add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz) {
-        add_force_sphere_async(fields, x, y, z, radius, fx, fy, fz, nullptr);
-        check_cuda(cudaStreamSynchronize(nullptr), "add_force_sphere synchronize");
-    }
-
-    void Solver3D::add_force_sphere_async(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream) {
+    void Solver3D::add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream) {
         validate_fields_(fields);
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
@@ -683,12 +619,7 @@ namespace stable_fluids {
         set_boundary_(3, w, stream);
     }
 
-    void Solver3D::step(const FieldSet& fields) {
-        step_async(fields, nullptr);
-        check_cuda(cudaStreamSynchronize(nullptr), "step synchronize");
-    }
-
-    void Solver3D::step_async(const FieldSet& fields, Stream stream) {
+    void Solver3D::step(const FieldSet& fields, Stream stream) {
         validate_fields_(fields);
 
         copy_compact_to_ghosted_(density_, reinterpret_cast<const float*>(fields.density.data), stream);
@@ -714,7 +645,7 @@ namespace stable_fluids {
         copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_z.data), w_, stream);
     }
 
-    void Solver3D::snapshot_density_async(const FieldSet& fields, const BufferView& destination, Stream stream) {
+    void Solver3D::snapshot_density(const FieldSet& fields, const BufferView& destination, Stream stream) {
         validate_fields_(fields);
         if (destination.data == nullptr) {
             throw std::invalid_argument("snapshot destination must provide a non-null device pointer");
@@ -835,67 +766,39 @@ uint64_t stable_fluids_context_required_scalar_field_bytes(const StableFluidsCon
     return context != nullptr && context->solver != nullptr ? context->solver->required_scalar_field_bytes() : 0;
 }
 
-int32_t stable_fluids_fields_clear(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_clear received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->zero_fields(*fields); });
-}
-
 int32_t stable_fluids_fields_clear_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_clear_async received a null argument");
     }
-    return stable_fluids_try(context, [&] { context->solver->zero_fields_async(*fields, to_stream(cuda_stream)); });
-}
-
-int32_t stable_fluids_fields_step(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_step received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->step(*fields); });
+    return stable_fluids_try(context, [&] { context->solver->zero_fields(*fields, to_stream(cuda_stream)); });
 }
 
 int32_t stable_fluids_fields_step_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_step_async received a null argument");
     }
-    return stable_fluids_try(context, [&] { context->solver->step_async(*fields, to_stream(cuda_stream)); });
-}
-
-int32_t stable_fluids_fields_add_density_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_density_splat received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->add_density_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->amount); });
+    return stable_fluids_try(context, [&] { context->solver->step(*fields, to_stream(cuda_stream)); });
 }
 
 int32_t stable_fluids_fields_add_density_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_density_splat_async received a null argument");
     }
-    return stable_fluids_try(context, [&] { context->solver->add_density_sphere_async(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->amount, to_stream(cuda_stream)); });
-}
-
-int32_t stable_fluids_fields_add_force_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_force_splat received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->add_force_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->force_x, splat->force_y, splat->force_z); });
+    return stable_fluids_try(context, [&] { context->solver->add_density_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->amount, to_stream(cuda_stream)); });
 }
 
 int32_t stable_fluids_fields_add_force_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_force_splat_async received a null argument");
     }
-    return stable_fluids_try(context, [&] { context->solver->add_force_sphere_async(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->force_x, splat->force_y, splat->force_z, to_stream(cuda_stream)); });
+    return stable_fluids_try(context, [&] { context->solver->add_force_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->force_x, splat->force_y, splat->force_z, to_stream(cuda_stream)); });
 }
 
 int32_t stable_fluids_fields_snapshot_density_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, StableFluidsBufferView destination, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_snapshot_density_async received a null argument");
     }
-    return stable_fluids_try(context, [&] { context->solver->snapshot_density_async(*fields, destination, to_stream(cuda_stream)); });
+    return stable_fluids_try(context, [&] { context->solver->snapshot_density(*fields, destination, to_stream(cuda_stream)); });
 }
 
 uint64_t stable_fluids_last_error_length(void) {

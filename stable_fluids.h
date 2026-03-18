@@ -86,10 +86,6 @@ STABLE_FLUIDS_API void stable_fluids_context_destroy(StableFluidsContext* contex
 STABLE_FLUIDS_API uint64_t stable_fluids_context_required_elements(const StableFluidsContext* context);
 STABLE_FLUIDS_API uint64_t stable_fluids_context_required_scalar_field_bytes(const StableFluidsContext* context);
 
-STABLE_FLUIDS_API int32_t stable_fluids_fields_clear(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields);
-STABLE_FLUIDS_API int32_t stable_fluids_fields_step(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields);
-STABLE_FLUIDS_API int32_t stable_fluids_fields_add_density_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat);
-STABLE_FLUIDS_API int32_t stable_fluids_fields_add_force_splat(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat);
 STABLE_FLUIDS_API int32_t stable_fluids_fields_clear_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream);
 STABLE_FLUIDS_API int32_t stable_fluids_fields_step_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream);
 STABLE_FLUIDS_API int32_t stable_fluids_fields_add_density_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat, void* cuda_stream);

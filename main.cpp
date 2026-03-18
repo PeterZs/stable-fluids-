@@ -74,11 +74,21 @@ int main() {
     float* velocity_x = nullptr;
     float* velocity_y = nullptr;
     float* velocity_z = nullptr;
+    cudaStream_t stream = nullptr;
 
     if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&density), field_bytes), "cudaMalloc density") ||
         !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_x), field_bytes), "cudaMalloc velocity_x") ||
         !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_y), field_bytes), "cudaMalloc velocity_y") ||
         !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_z), field_bytes), "cudaMalloc velocity_z")) {
+        cudaFree(density);
+        cudaFree(velocity_x);
+        cudaFree(velocity_y);
+        cudaFree(velocity_z);
+        stable_fluids_context_destroy(context);
+        return EXIT_FAILURE;
+    }
+
+    if (!cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags")) {
         cudaFree(density);
         cudaFree(velocity_x);
         cudaFree(velocity_y);
@@ -109,9 +119,10 @@ int main() {
     force_splat.force_y = 2.5f;
     force_splat.force_z = 0.75f;
 
-    if (!stable_ok(stable_fluids_fields_clear(context, &fields), "stable_fluids_fields_clear", context) ||
-        !stable_ok(stable_fluids_fields_add_density_splat(context, &fields, &density_splat), "stable_fluids_fields_add_density_splat", context) ||
-        !stable_ok(stable_fluids_fields_add_force_splat(context, &fields, &force_splat), "stable_fluids_fields_add_force_splat", context)) {
+    if (!stable_ok(stable_fluids_fields_clear_async(context, &fields, stream), "stable_fluids_fields_clear_async", context) ||
+        !stable_ok(stable_fluids_fields_add_density_splat_async(context, &fields, &density_splat, stream), "stable_fluids_fields_add_density_splat_async", context) ||
+        !stable_ok(stable_fluids_fields_add_force_splat_async(context, &fields, &force_splat, stream), "stable_fluids_fields_add_force_splat_async", context)) {
+        cudaStreamDestroy(stream);
         cudaFree(density);
         cudaFree(velocity_x);
         cudaFree(velocity_y);
@@ -132,8 +143,9 @@ int main() {
             pulse_force.force_y = 0.5f;
             pulse_force.force_z = 0.0f;
 
-            if (!stable_ok(stable_fluids_fields_add_density_splat(context, &fields, &pulse_density), "stable_fluids_fields_add_density_splat", context) ||
-                !stable_ok(stable_fluids_fields_add_force_splat(context, &fields, &pulse_force), "stable_fluids_fields_add_force_splat", context)) {
+            if (!stable_ok(stable_fluids_fields_add_density_splat_async(context, &fields, &pulse_density, stream), "stable_fluids_fields_add_density_splat_async", context) ||
+                !stable_ok(stable_fluids_fields_add_force_splat_async(context, &fields, &pulse_force, stream), "stable_fluids_fields_add_force_splat_async", context)) {
+                cudaStreamDestroy(stream);
                 cudaFree(density);
                 cudaFree(velocity_x);
                 cudaFree(velocity_y);
@@ -143,7 +155,8 @@ int main() {
             }
         }
 
-        if (!stable_ok(stable_fluids_fields_step(context, &fields), "stable_fluids_fields_step", context)) {
+        if (!stable_ok(stable_fluids_fields_step_async(context, &fields, stream), "stable_fluids_fields_step_async", context)) {
+            cudaStreamDestroy(stream);
             cudaFree(density);
             cudaFree(velocity_x);
             cudaFree(velocity_y);
@@ -153,8 +166,19 @@ int main() {
         }
     }
 
+    if (!cuda_ok(cudaStreamSynchronize(stream), "cudaStreamSynchronize")) {
+        cudaStreamDestroy(stream);
+        cudaFree(density);
+        cudaFree(velocity_x);
+        cudaFree(velocity_y);
+        cudaFree(velocity_z);
+        stable_fluids_context_destroy(context);
+        return EXIT_FAILURE;
+    }
+
     std::vector<float> host_density(static_cast<std::size_t>(element_count), 0.0f);
     if (!cuda_ok(cudaMemcpy(host_density.data(), density, field_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy density to host")) {
+        cudaStreamDestroy(stream);
         cudaFree(density);
         cudaFree(velocity_x);
         cudaFree(velocity_y);
@@ -172,6 +196,7 @@ int main() {
     std::cout << "total density: " << total_density << '\n';
     std::cout << "peak density: " << peak_density << '\n';
 
+    cudaStreamDestroy(stream);
     cudaFree(density);
     cudaFree(velocity_x);
     cudaFree(velocity_y);
