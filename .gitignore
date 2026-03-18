@@ -5,3 +5,4 @@ build-*
 build*
 data/
 AGENTS.md
+rebuild.bat
