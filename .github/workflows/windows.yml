@@ -1,0 +1,68 @@
+name: Windows
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+    workflow_dispatch:
+
+jobs:
+    cuda-build:
+        name: Windows CUDA Build
+        runs-on: windows-2022
+        env:
+            BUILD_DIR: build-windows
+            CUDA_VERSION: 13.2.0
+            CUDA_ARCHITECTURES: 75
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Install CMake and Ninja
+              run: python -m pip install --upgrade pip cmake==4.1.2 ninja==1.13.0
+
+            - name: Set up MSVC
+              uses: ilammy/msvc-dev-cmd@v1
+              with:
+                  arch: x64
+
+            - name: Install CUDA Toolkit
+              uses: Jimver/cuda-toolkit@v0.2.30
+              with:
+                  cuda: ${{ env.CUDA_VERSION }}
+                  method: local
+                  log-file-suffix: windows-2022.txt
+
+            - name: Show toolchain versions
+              shell: pwsh
+              run: |
+                  cmake --version
+                  ninja --version
+                  nvcc --version
+                  cl
+
+            - name: Configure
+              shell: pwsh
+              run: >
+                  cmake -S . -B $env:BUILD_DIR -G Ninja
+                  -DCMAKE_BUILD_TYPE=Release
+                  -DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCHITECTURES }}
+
+            - name: Build
+              shell: pwsh
+              run: cmake --build $env:BUILD_DIR --parallel
+
+            - name: Upload Windows artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: stable-fluids-windows
+                  path: |
+                      ${{ env.BUILD_DIR }}/stable-fluids-app.exe
+                      ${{ env.BUILD_DIR }}/stable-fluids.dll
+                      ${{ env.BUILD_DIR }}/stable-fluids.lib
