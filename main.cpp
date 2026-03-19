@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <exception>
 #include <iostream>
 #include <nvtx3/nvtx3.hpp>
 #include <numeric>
@@ -22,18 +23,15 @@ bool stable_ok(const int32_t code, const char* what) {
     if (code == STABLE_FLUIDS_SUCCESS) {
         return true;
     }
-    std::cerr << what << " failed (" << code << ")";
-    if (const char* message = stable_fluids_last_error(); message != nullptr && message[0] != '\0') {
-        std::cerr << ": " << message;
-    }
-    std::cerr << '\n';
+    std::cerr << what << " failed (" << code << ")\n";
     return false;
 }
 
 } // namespace
 
 int main() {
-    nvtx3::scoped_range app_range{"stable.demo"};
+    try {
+        nvtx3::scoped_range app_range{"stable.demo"};
 
     constexpr int32_t nx = 96;
     constexpr int32_t ny = 96;
@@ -150,5 +148,9 @@ int main() {
     cudaFree(velocity_y);
     cudaFree(velocity_z);
     cudaFree(workspace);
-    return EXIT_SUCCESS;
+        return EXIT_SUCCESS;
+    } catch (const std::exception& ex) {
+        std::cerr << ex.what() << '\n';
+        return EXIT_FAILURE;
+    }
 }

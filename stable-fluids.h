@@ -15,10 +15,7 @@
 #define STABLE_FLUIDS_API
 #endif
 
-#define STABLE_FLUIDS_SUCCESS                 0
-#define STABLE_FLUIDS_ERROR_INVALID_ARGUMENT  -1
-#define STABLE_FLUIDS_ERROR_RUNTIME           -2
-#define STABLE_FLUIDS_ERROR_ALLOCATION_FAILED -3
+#define STABLE_FLUIDS_SUCCESS 0
 
 #ifdef __cplusplus
 extern "C" {
@@ -115,8 +112,6 @@ STABLE_FLUIDS_API int32_t stable_fluids_compute_velocity_magnitude_async(
     int32_t nz,
     float cell_size,
     void* cuda_stream);
-
-STABLE_FLUIDS_API const char* stable_fluids_last_error(void);
 
 #ifdef __cplusplus
 }
