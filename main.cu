@@ -347,15 +347,12 @@ int main() {
     std::cout << "stable-fluids benchmark\n";
     std::cout << "grid: " << nx << " x " << ny << " x " << nz << '\n';
     std::cout << "frames: " << frames << '\n';
-    std::cout << "cpu_total_ms: " << cpu_ms << '\n';
-    std::cout << "cpu_step_ms: " << cpu_ms / static_cast<double>(frames) << '\n';
-    std::cout << "cpu_total_density: " << cpu_total_density << '\n';
-    std::cout << "cpu_peak_density: " << cpu_peak_density << '\n';
-    std::cout << "cuda_total_ms: " << cuda_ms << '\n';
-    std::cout << "cuda_step_ms: " << cuda_ms / static_cast<double>(frames) << '\n';
-    std::cout << "cuda_total_density: " << cuda_total_density << '\n';
-    std::cout << "cuda_peak_density: " << cuda_peak_density << '\n';
-    std::cout << "density_l1_diff: " << density_l1_diff << '\n';
-    if (cuda_ms > 0.0) std::cout << "speedup: " << cpu_ms / cuda_ms << "x\n";
+    std::cout << "| metric | cpu | cuda | extra |\n";
+    std::cout << "|---|---:|---:|---:|\n";
+    std::cout << "| total_ms | " << cpu_ms << " | " << cuda_ms << " | " << (cuda_ms > 0.0 ? cpu_ms / cuda_ms : 0.0) << "x |\n";
+    std::cout << "| step_ms | " << cpu_ms / static_cast<double>(frames) << " | " << cuda_ms / static_cast<double>(frames) << " | " << (cuda_ms > 0.0 ? cpu_ms / cuda_ms : 0.0) << "x |\n";
+    std::cout << "| total_density | " << cpu_total_density << " | " << cuda_total_density << " | - |\n";
+    std::cout << "| peak_density | " << cpu_peak_density << " | " << cuda_peak_density << " | - |\n";
+    std::cout << "| density_l1_diff | - | - | " << density_l1_diff << " |\n";
     return EXIT_SUCCESS;
 }
