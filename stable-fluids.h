@@ -92,6 +92,7 @@ STABLE_FLUIDS_API int32_t stable_fluids_fields_step_async(StableFluidsContext* c
 STABLE_FLUIDS_API int32_t stable_fluids_fields_add_density_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat, void* cuda_stream);
 STABLE_FLUIDS_API int32_t stable_fluids_fields_add_force_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat, void* cuda_stream);
 STABLE_FLUIDS_API int32_t stable_fluids_fields_snapshot_density_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, StableFluidsBufferView destination, void* cuda_stream);
+STABLE_FLUIDS_API int32_t stable_fluids_fields_snapshot_velocity_magnitude_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, StableFluidsBufferView destination, void* cuda_stream);
 
 STABLE_FLUIDS_API uint64_t stable_fluids_last_error_length(void);
 STABLE_FLUIDS_API uint64_t stable_fluids_context_last_error_length(const StableFluidsContext* context);

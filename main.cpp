@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <iostream>
+#include <nvtx3/nvtx3.hpp>
 #include <numeric>
 #include <vector>
 
@@ -49,6 +50,7 @@ StableFluidsBufferView make_f32_device_buffer(void* data, uint64_t size_bytes) {
 }  // namespace
 
 int main() {
+    nvtx3::scoped_range app_range{"stable.demo"};
     StableFluidsContextDesc context_desc = stable_fluids_context_desc_default();
     context_desc.nx = 96;
     context_desc.ny = 96;
@@ -132,6 +134,7 @@ int main() {
     }
 
     for (int frame = 0; frame < 24; ++frame) {
+        nvtx3::scoped_range frame_range{"stable.demo.frame"};
         if (frame < 8) {
             StableFluidsDensitySplatDesc pulse_density = density_splat;
             pulse_density.radius = 4.0f;
