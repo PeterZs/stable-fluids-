@@ -8,8 +8,98 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-int32_t stable_demo_add_source_async(void* density, void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float center_x, float center_y, float center_z, float radius, float density_amount, float velocity_source_x, float velocity_source_y, float velocity_source_z, int32_t block_x, int32_t block_y, int32_t block_z,
-    void* cuda_stream);
+namespace {
+
+    int32_t cuda_code(const cudaError_t status) noexcept {
+        return status == cudaSuccess ? 0 : 5001;
+    }
+
+    dim3 make_grid(const int nx, const int ny, const int nz, const dim3& block) {
+        return dim3(static_cast<unsigned>((nx + static_cast<int>(block.x) - 1) / static_cast<int>(block.x)), static_cast<unsigned>((ny + static_cast<int>(block.y) - 1) / static_cast<int>(block.y)), static_cast<unsigned>((nz + static_cast<int>(block.z) - 1) / static_cast<int>(block.z)));
+    }
+
+    __device__ std::uint64_t index_3d(const int x, const int y, const int z, const int sx, const int sy) {
+        return static_cast<std::uint64_t>(z) * static_cast<std::uint64_t>(sx) * static_cast<std::uint64_t>(sy) + static_cast<std::uint64_t>(y) * static_cast<std::uint64_t>(sx) + static_cast<std::uint64_t>(x);
+    }
+
+    __global__ void source_cells_kernel(float* density, const float center_x, const float center_y, const float center_z, const float radius, const float amount, const int nx, const int ny, const int nz) {
+        const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+        const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+        if (x >= nx || y >= ny || z >= nz) return;
+
+        const float dx = (static_cast<float>(x) + 0.5f) - center_x;
+        const float dy = (static_cast<float>(y) + 0.5f) - center_y;
+        const float dz = (static_cast<float>(z) + 0.5f) - center_z;
+        const float radius2 = radius * radius;
+        const float dist2 = dx * dx + dy * dy + dz * dz;
+        if (dist2 > radius2) return;
+        density[index_3d(x, y, z, nx, ny)] += amount * fmaxf(0.0f, 1.0f - dist2 / radius2);
+    }
+
+    __global__ void source_u_kernel(float* velocity_x, const int nx, const int ny, const int nz, const float center_x, const float center_y, const float center_z, const float radius, const float amount) {
+        const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+        const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+        if (x > nx || y >= ny || z >= nz) return;
+
+        const float dx = static_cast<float>(x) - center_x;
+        const float dy = (static_cast<float>(y) + 0.5f) - center_y;
+        const float dz = (static_cast<float>(z) + 0.5f) - center_z;
+        const float radius2 = radius * radius;
+        const float dist2 = dx * dx + dy * dy + dz * dz;
+        if (dist2 > radius2) return;
+        velocity_x[index_3d(x, y, z, nx + 1, ny)] += amount * fmaxf(0.0f, 1.0f - dist2 / radius2);
+    }
+
+    __global__ void source_v_kernel(float* velocity_y, const int nx, const int ny, const int nz, const float center_x, const float center_y, const float center_z, const float radius, const float amount) {
+        const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+        const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+        if (x >= nx || y > ny || z >= nz) return;
+
+        const float dx = (static_cast<float>(x) + 0.5f) - center_x;
+        const float dy = static_cast<float>(y) - center_y;
+        const float dz = (static_cast<float>(z) + 0.5f) - center_z;
+        const float radius2 = radius * radius;
+        const float dist2 = dx * dx + dy * dy + dz * dz;
+        if (dist2 > radius2) return;
+        velocity_y[index_3d(x, y, z, nx, ny + 1)] += amount * fmaxf(0.0f, 1.0f - dist2 / radius2);
+    }
+
+    __global__ void source_w_kernel(float* velocity_z, const int nx, const int ny, const int nz, const float center_x, const float center_y, const float center_z, const float radius, const float amount) {
+        const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+        const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+        if (x >= nx || y >= ny || z > nz) return;
+
+        const float dx = (static_cast<float>(x) + 0.5f) - center_x;
+        const float dy = (static_cast<float>(y) + 0.5f) - center_y;
+        const float dz = static_cast<float>(z) - center_z;
+        const float radius2 = radius * radius;
+        const float dist2 = dx * dx + dy * dy + dz * dz;
+        if (dist2 > radius2) return;
+        velocity_z[index_3d(x, y, z, nx, ny)] += amount * fmaxf(0.0f, 1.0f - dist2 / radius2);
+    }
+
+    int32_t stable_demo_add_source_async(void* density, void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float center_x, float center_y, float center_z, float radius, float density_amount, float velocity_source_x, float velocity_source_y, float velocity_source_z, int32_t block_x, int32_t block_y,
+        int32_t block_z, void* cuda_stream) {
+        if (nx <= 0 || ny <= 0 || nz <= 0) return 1001;
+        if (radius <= 0.0f) return 1005;
+        if (density == nullptr) return 2001;
+        if (velocity_x == nullptr) return 2003;
+        if (velocity_y == nullptr) return 2004;
+        if (velocity_z == nullptr) return 2005;
+
+        const dim3 block{static_cast<unsigned>(std::max(block_x, 1)), static_cast<unsigned>(std::max(block_y, 1)), static_cast<unsigned>(std::max(block_z, 1))};
+        source_cells_kernel<<<make_grid(nx, ny, nz, block), block, 0, reinterpret_cast<cudaStream_t>(cuda_stream)>>>(reinterpret_cast<float*>(density), center_x, center_y, center_z, radius, density_amount, nx, ny, nz);
+        source_u_kernel<<<make_grid(nx + 1, ny, nz, block), block, 0, reinterpret_cast<cudaStream_t>(cuda_stream)>>>(reinterpret_cast<float*>(velocity_x), nx, ny, nz, center_x, center_y, center_z, radius, velocity_source_x);
+        source_v_kernel<<<make_grid(nx, ny + 1, nz, block), block, 0, reinterpret_cast<cudaStream_t>(cuda_stream)>>>(reinterpret_cast<float*>(velocity_y), nx, ny, nz, center_x, center_y, center_z, radius, velocity_source_y);
+        source_w_kernel<<<make_grid(nx, ny, nz + 1, block), block, 0, reinterpret_cast<cudaStream_t>(cuda_stream)>>>(reinterpret_cast<float*>(velocity_z), nx, ny, nz, center_x, center_y, center_z, radius, velocity_source_z);
+        return cuda_code(cudaGetLastError());
+    }
+
+} // namespace
 
 int main() {
     nvtx3::scoped_range app_range{"stable.demo"};
@@ -37,11 +127,11 @@ int main() {
     constexpr int32_t block_y             = 8;
     constexpr int32_t block_z             = 8;
 
-    const uint64_t scalar_bytes           = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
-    const uint64_t velocity_x_bytes       = static_cast<uint64_t>(nx + 1) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
-    const uint64_t velocity_y_bytes       = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny + 1) * static_cast<uint64_t>(nz) * sizeof(float);
-    const uint64_t velocity_z_bytes       = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz + 1) * sizeof(float);
-    const uint64_t element_count          = scalar_bytes / sizeof(float);
+    const uint64_t scalar_bytes     = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
+    const uint64_t velocity_x_bytes = static_cast<uint64_t>(nx + 1) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
+    const uint64_t velocity_y_bytes = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny + 1) * static_cast<uint64_t>(nz) * sizeof(float);
+    const uint64_t velocity_z_bytes = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz + 1) * sizeof(float);
+    const uint64_t element_count    = scalar_bytes / sizeof(float);
 
     float* density                       = nullptr;
     float* velocity_x                    = nullptr;
@@ -129,35 +219,35 @@ int main() {
         }
 
         StableFluidsStepDesc step_desc{};
-        step_desc.struct_size                  = sizeof(StableFluidsStepDesc);
-        step_desc.api_version                  = 1;
-        step_desc.nx                           = nx;
-        step_desc.ny                           = ny;
-        step_desc.nz                           = nz;
-        step_desc.cell_size                    = cell_size;
-        step_desc.dt                           = dt;
-        step_desc.viscosity                    = viscosity;
-        step_desc.diffusion                    = diffusion;
-        step_desc.diffuse_iterations           = diffuse_iterations;
-        step_desc.pressure_iterations          = pressure_iterations;
-        step_desc.density                      = density;
-        step_desc.velocity_x                   = velocity_x;
-        step_desc.velocity_y                   = velocity_y;
-        step_desc.velocity_z                   = velocity_z;
-        step_desc.temporary_density            = temporary_density;
-        step_desc.temporary_velocity_x         = temporary_velocity_x;
-        step_desc.temporary_velocity_y         = temporary_velocity_y;
-        step_desc.temporary_velocity_z         = temporary_velocity_z;
-        step_desc.temporary_previous_density   = temporary_previous_density;
+        step_desc.struct_size                   = sizeof(StableFluidsStepDesc);
+        step_desc.api_version                   = 1;
+        step_desc.nx                            = nx;
+        step_desc.ny                            = ny;
+        step_desc.nz                            = nz;
+        step_desc.cell_size                     = cell_size;
+        step_desc.dt                            = dt;
+        step_desc.viscosity                     = viscosity;
+        step_desc.diffusion                     = diffusion;
+        step_desc.diffuse_iterations            = diffuse_iterations;
+        step_desc.pressure_iterations           = pressure_iterations;
+        step_desc.density                       = density;
+        step_desc.velocity_x                    = velocity_x;
+        step_desc.velocity_y                    = velocity_y;
+        step_desc.velocity_z                    = velocity_z;
+        step_desc.temporary_density             = temporary_density;
+        step_desc.temporary_velocity_x          = temporary_velocity_x;
+        step_desc.temporary_velocity_y          = temporary_velocity_y;
+        step_desc.temporary_velocity_z          = temporary_velocity_z;
+        step_desc.temporary_previous_density    = temporary_previous_density;
         step_desc.temporary_previous_velocity_x = temporary_previous_velocity_x;
         step_desc.temporary_previous_velocity_y = temporary_previous_velocity_y;
         step_desc.temporary_previous_velocity_z = temporary_previous_velocity_z;
-        step_desc.temporary_pressure           = temporary_pressure;
-        step_desc.temporary_divergence         = temporary_divergence;
-        step_desc.block_x                      = block_x;
-        step_desc.block_y                      = block_y;
-        step_desc.block_z                      = block_z;
-        step_desc.stream                       = stream;
+        step_desc.temporary_pressure            = temporary_pressure;
+        step_desc.temporary_divergence          = temporary_divergence;
+        step_desc.block_x                       = block_x;
+        step_desc.block_y                       = block_y;
+        step_desc.block_z                       = block_z;
+        step_desc.stream                        = stream;
         if (!stable_ok(stable_fluids_step_cuda(&step_desc), "stable_fluids_step_cuda")) {
             cudaStreamDestroy(stream);
             cudaFree(density);

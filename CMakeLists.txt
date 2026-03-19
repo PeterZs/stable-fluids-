@@ -33,8 +33,7 @@ add_library(
 
 add_executable(
         stable-fluids-app
-        main.cpp
-        demo_ops.cu
+        main.cu
 )
 
 target_compile_definitions(stable-fluids PRIVATE STABLE_FLUIDS_BUILD_SHARED)
