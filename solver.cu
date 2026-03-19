@@ -244,15 +244,6 @@ namespace stable_fluids {
             w[idx] -= half_inv_h * (pressure[ghosted_index(i, j, k + 1, nx_total, ny_total)] - pressure[ghosted_index(i, j, k - 1, nx_total, ny_total)]);
         }
 
-        __global__ void velocity_magnitude_kernel(float* dst, const float* u, const float* v, const float* w, std::size_t count) {
-            const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= count) return;
-            const float ux = u[idx];
-            const float vy = v[idx];
-            const float wz = w[idx];
-            dst[idx] = sqrtf(ux * ux + vy * vy + wz * wz);
-        }
-
     } // namespace
 
 } // namespace stable_fluids
@@ -514,23 +505,6 @@ int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity
     copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(u_compact, u_g, nx, ny, nx_total, ny_total, interior_cell_count);
     copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(v_compact, v_g, nx, ny, nx_total, ny_total, interior_cell_count);
     copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(w_compact, w_g, nx, ny, nx_total, ny_total, interior_cell_count);
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
-    return 0;
-}
-
-int32_t stable_fluids_compute_velocity_magnitude_async(void* velocity_x, void* velocity_y, void* velocity_z, void* destination, int32_t nx, int32_t ny, int32_t nz, void* cuda_stream) {
-    using namespace stable_fluids;
-    if (nx <= 0 || ny <= 0 || nz <= 0) return 1001;
-    const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
-    if (velocity_x == nullptr) return 2003;
-    if (velocity_y == nullptr) return 2004;
-    if (velocity_z == nullptr) return 2005;
-    if (destination == nullptr) return 2006;
-
-    nvtx3::scoped_range range{"stable.snapshot_velocity_magnitude"};
-    constexpr int block_size = 256;
-    const int grid_size      = static_cast<int>((compact_count + block_size - 1) / block_size);
-    velocity_magnitude_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(reinterpret_cast<float*>(destination), reinterpret_cast<const float*>(velocity_x), reinterpret_cast<const float*>(velocity_y), reinterpret_cast<const float*>(velocity_z), compact_count);
     if (cuda_code(cudaGetLastError()) != 0) return 5001;
     return 0;
 }

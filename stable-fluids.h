@@ -33,7 +33,6 @@ Error code scheme:
 2003  : invalid velocity_x buffer
 2004  : invalid velocity_y buffer
 2005  : invalid velocity_z buffer
-2006  : invalid destination buffer
 2007  : invalid temporary density buffer
 2008  : invalid temporary velocity_x buffer
 2009  : invalid temporary velocity_y buffer
@@ -59,8 +58,6 @@ STABLE_FLUIDS_API int32_t stable_fluids_add_force_splat_async(void* velocity_x, 
 
 STABLE_FLUIDS_API int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float cell_size, void* temporary_density, void* temporary_velocity_x, void* temporary_velocity_y, void* temporary_velocity_z, void* temporary_previous_density, void* temporary_previous_velocity_x,
     void* temporary_previous_velocity_y, void* temporary_previous_velocity_z, void* temporary_pressure, void* temporary_divergence, float dt, float viscosity, float diffusion, int32_t diffuse_iterations, int32_t pressure_iterations, int32_t block_x, int32_t block_y, int32_t block_z, void* cuda_stream);
-
-STABLE_FLUIDS_API int32_t stable_fluids_compute_velocity_magnitude_async(void* velocity_x, void* velocity_y, void* velocity_z, void* destination, int32_t nx, int32_t ny, int32_t nz, void* cuda_stream);
 
 #ifdef __cplusplus
 }
