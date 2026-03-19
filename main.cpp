@@ -8,6 +8,9 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+int32_t stable_demo_add_density_splat_async(void* density, int32_t nx, int32_t ny, int32_t nz, float center_x, float center_y, float center_z, float radius, float amount, int32_t block_x, int32_t block_y, int32_t block_z, void* cuda_stream);
+int32_t stable_demo_add_force_splat_async(void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float center_x, float center_y, float center_z, float radius, float force_x, float force_y, float force_z, int32_t block_x, int32_t block_y, int32_t block_z, void* cuda_stream);
+
 int main() {
     nvtx3::scoped_range app_range{"stable.demo"};
     auto cuda_ok = [](const cudaError_t status, const char* what) {
@@ -34,8 +37,8 @@ int main() {
     constexpr int32_t block_y             = 8;
     constexpr int32_t block_z             = 8;
 
-    const uint64_t scalar_bytes          = stable_fluids_scalar_field_bytes(nx, ny, nz);
-    const uint64_t temporary_field_bytes = stable_fluids_temporary_field_bytes(nx, ny, nz);
+    const uint64_t scalar_bytes          = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
+    const uint64_t temporary_field_bytes = static_cast<uint64_t>(nx + 2) * static_cast<uint64_t>(ny + 2) * static_cast<uint64_t>(nz + 2) * sizeof(float);
     const uint64_t element_count         = scalar_bytes / sizeof(float);
 
     float* density                       = nullptr;
@@ -79,9 +82,10 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    if (!stable_ok(stable_fluids_clear_async(density, velocity_x, velocity_y, velocity_z, nx, ny, nz, stream), "stable_fluids_clear_async")
-        || !stable_ok(stable_fluids_add_density_splat_async(density, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 5.0f, 6.0f, stream), "stable_fluids_add_density_splat_async")
-        || !stable_ok(stable_fluids_add_force_splat_async(velocity_x, velocity_y, velocity_z, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 6.0f, 1.25f, 2.5f, 0.75f, stream), "stable_fluids_add_force_splat_async")) {
+    if (!cuda_ok(cudaMemsetAsync(density, 0, scalar_bytes, stream), "cudaMemsetAsync density") || !cuda_ok(cudaMemsetAsync(velocity_x, 0, scalar_bytes, stream), "cudaMemsetAsync velocity_x") || !cuda_ok(cudaMemsetAsync(velocity_y, 0, scalar_bytes, stream), "cudaMemsetAsync velocity_y")
+        || !cuda_ok(cudaMemsetAsync(velocity_z, 0, scalar_bytes, stream), "cudaMemsetAsync velocity_z")
+        || !stable_ok(stable_demo_add_density_splat_async(density, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 5.0f, 6.0f, block_x, block_y, block_z, stream), "stable_demo_add_density_splat_async")
+        || !stable_ok(stable_demo_add_force_splat_async(velocity_x, velocity_y, velocity_z, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 6.0f, 1.25f, 2.5f, 0.75f, block_x, block_y, block_z, stream), "stable_demo_add_force_splat_async")) {
         cudaStreamDestroy(stream);
         cudaFree(density);
         cudaFree(velocity_x);
@@ -103,8 +107,8 @@ int main() {
     for (int frame = 0; frame < 24; ++frame) {
         nvtx3::scoped_range frame_range{"stable.demo.frame"};
         if (frame < 8) {
-            if (!stable_ok(stable_fluids_add_density_splat_async(density, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 4.0f, 1.5f, stream), "stable_fluids_add_density_splat_async")
-                || !stable_ok(stable_fluids_add_force_splat_async(velocity_x, velocity_y, velocity_z, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 4.0f, 0.0f, 0.5f, 0.0f, stream), "stable_fluids_add_force_splat_async")) {
+            if (!stable_ok(stable_demo_add_density_splat_async(density, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 4.0f, 1.5f, block_x, block_y, block_z, stream), "stable_demo_add_density_splat_async")
+                || !stable_ok(stable_demo_add_force_splat_async(velocity_x, velocity_y, velocity_z, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 4.0f, 0.0f, 0.5f, 0.0f, block_x, block_y, block_z, stream), "stable_demo_add_force_splat_async")) {
                 cudaStreamDestroy(stream);
                 cudaFree(density);
                 cudaFree(velocity_x);

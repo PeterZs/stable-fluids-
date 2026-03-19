@@ -33,6 +33,7 @@ add_library(
 add_executable(
         stable-fluids-app
         main.cpp
+        demo_ops.cu
 )
 
 target_compile_definitions(stable-fluids PRIVATE STABLE_FLUIDS_BUILD_SHARED)
@@ -46,14 +47,19 @@ target_link_libraries(stable-fluids-app PRIVATE stable-fluids CUDA::cudart)
 # ============================================================================
 if (MSVC)
     target_compile_options(stable-fluids PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive->)
-    target_compile_options(stable-fluids-app PRIVATE /W4 /permissive-)
+    target_compile_options(stable-fluids-app PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive->)
 else ()
     target_compile_options(stable-fluids PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
-    target_compile_options(stable-fluids-app PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(stable-fluids-app PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
 endif ()
 
 target_compile_options(
         stable-fluids
+        PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>
+)
+target_compile_options(
+        stable-fluids-app
         PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>
 )

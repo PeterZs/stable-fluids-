@@ -23,10 +23,6 @@ namespace stable_fluids {
             return (z * ny_total + y) * nx_total + x;
         }
 
-        __host__ __device__ inline std::uint64_t compact_index(int x, int y, int z, int nx, int ny) {
-            return static_cast<std::uint64_t>(z) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nx) + static_cast<std::uint64_t>(y) * static_cast<std::uint64_t>(nx) + static_cast<std::uint64_t>(x);
-        }
-
         __device__ inline float clampf(float value, float lo, float hi) {
             return fminf(fmaxf(value, lo), hi);
         }
@@ -69,11 +65,6 @@ namespace stable_fluids {
         __global__ void fill_kernel(float* field, float value, std::size_t count) {
             const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (idx < count) field[idx] = value;
-        }
-
-        __global__ void zero_compact_field_kernel(float* field, std::size_t count) {
-            const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx < count) field[idx] = 0.0f;
         }
 
         __global__ void copy_compact_to_ghosted_kernel(float* ghosted, const float* compact, int nx, int ny, int nx_total, int ny_total, std::size_t count) {
@@ -130,43 +121,6 @@ namespace stable_fluids {
             const int dst = ghosted_index(i, j, k, nx_total, ny_total);
             const int src = ghosted_index(ii, jj, kk, nx_total, ny_total);
             field[dst]    = field[src] * (sign_sum / static_cast<float>(max(sign_count, 1)));
-        }
-
-        __global__ void splat_density_compact_kernel(float* density, float center_x, float center_y, float center_z, float radius, float amount, int nx, int ny, int nz) {
-            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
-            if (x >= nx || y >= ny || z >= nz) return;
-
-            const float dx      = static_cast<float>(x) - center_x;
-            const float dy      = static_cast<float>(y) - center_y;
-            const float dz      = static_cast<float>(z) - center_z;
-            const float dist2   = dx * dx + dy * dy + dz * dz;
-            const float radius2 = radius * radius;
-            if (dist2 > radius2) return;
-
-            const float falloff = 1.0f - sqrtf(dist2 / fmaxf(radius2, 1.0e-6f));
-            density[compact_index(x, y, z, nx, ny)] += amount * falloff;
-        }
-
-        __global__ void splat_force_compact_kernel(float* u, float* v, float* w, float center_x, float center_y, float center_z, float radius, float fx, float fy, float fz, int nx, int ny, int nz) {
-            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
-            if (x >= nx || y >= ny || z >= nz) return;
-
-            const float dx      = static_cast<float>(x) - center_x;
-            const float dy      = static_cast<float>(y) - center_y;
-            const float dz      = static_cast<float>(z) - center_z;
-            const float dist2   = dx * dx + dy * dy + dz * dz;
-            const float radius2 = radius * radius;
-            if (dist2 > radius2) return;
-
-            const float falloff     = 1.0f - sqrtf(dist2 / fmaxf(radius2, 1.0e-6f));
-            const std::uint64_t idx = compact_index(x, y, z, nx, ny);
-            u[idx] += fx * falloff;
-            v[idx] += fy * falloff;
-            w[idx] += fz * falloff;
         }
 
         __global__ void advect_scalar_kernel(float* dst, const float* src, const float* u, const float* v, const float* w, float dt_over_h, int nx, int ny, int nz, int nx_total, int ny_total) {
@@ -257,67 +211,6 @@ namespace {
 } // namespace
 
 extern "C" {
-
-uint64_t stable_fluids_scalar_field_bytes(int32_t nx, int32_t ny, int32_t nz) {
-    if (nx <= 0 || ny <= 0 || nz <= 0) return 0;
-    return static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
-}
-
-uint64_t stable_fluids_temporary_field_bytes(int32_t nx, int32_t ny, int32_t nz) {
-    if (nx <= 0 || ny <= 0 || nz <= 0) return 0;
-    return static_cast<uint64_t>(nx + 2) * static_cast<uint64_t>(ny + 2) * static_cast<uint64_t>(nz + 2) * sizeof(float);
-}
-
-int32_t stable_fluids_clear_async(void* density, void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, void* cuda_stream) {
-    using namespace stable_fluids;
-    if (nx <= 0 || ny <= 0 || nz <= 0) return 1001;
-    const auto compact_bytes = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
-    if (density == nullptr) return 2001;
-    if (velocity_x == nullptr) return 2003;
-    if (velocity_y == nullptr) return 2004;
-    if (velocity_z == nullptr) return 2005;
-
-    nvtx3::scoped_range range{"stable.clear"};
-    constexpr int block_size = 256;
-    const int grid_size      = static_cast<int>((compact_bytes / sizeof(float) + block_size - 1) / block_size);
-    auto* density_f          = reinterpret_cast<float*>(density);
-    auto* u                  = reinterpret_cast<float*>(velocity_x);
-    auto* v                  = reinterpret_cast<float*>(velocity_y);
-    auto* w                  = reinterpret_cast<float*>(velocity_z);
-    zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(density_f, compact_bytes / sizeof(float));
-    zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(u, compact_bytes / sizeof(float));
-    zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(v, compact_bytes / sizeof(float));
-    zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(w, compact_bytes / sizeof(float));
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
-    return 0;
-}
-
-int32_t stable_fluids_add_density_splat_async(void* density, int32_t nx, int32_t ny, int32_t nz, float center_x, float center_y, float center_z, float radius, float amount, void* cuda_stream) {
-    using namespace stable_fluids;
-    if (nx <= 0 || ny <= 0 || nz <= 0) return 1001;
-    if (density == nullptr) return 2001;
-    nvtx3::scoped_range range{"stable.add_density_splat"};
-    const dim3 block{8u, 8u, 8u};
-    const dim3 grid = make_grid(nx, ny, nz, block);
-    splat_density_compact_kernel<<<grid, block, 0, to_stream(cuda_stream)>>>(reinterpret_cast<float*>(density), center_x, center_y, center_z, fmaxf(radius, 1.0f), amount, nx, ny, nz);
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
-    return 0;
-}
-
-int32_t stable_fluids_add_force_splat_async(void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float center_x, float center_y, float center_z, float radius, float force_x, float force_y, float force_z, void* cuda_stream) {
-    using namespace stable_fluids;
-    if (nx <= 0 || ny <= 0 || nz <= 0) return 1001;
-    if (velocity_x == nullptr) return 2003;
-    if (velocity_y == nullptr) return 2004;
-    if (velocity_z == nullptr) return 2005;
-
-    nvtx3::scoped_range range{"stable.add_force_splat"};
-    const dim3 block{8u, 8u, 8u};
-    const dim3 grid = make_grid(nx, ny, nz, block);
-    splat_force_compact_kernel<<<grid, block, 0, to_stream(cuda_stream)>>>(reinterpret_cast<float*>(velocity_x), reinterpret_cast<float*>(velocity_y), reinterpret_cast<float*>(velocity_z), center_x, center_y, center_z, fmaxf(radius, 1.0f), force_x, force_y, force_z, nx, ny, nz);
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
-    return 0;
-}
 
 int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float cell_size, void* temporary_density, void* temporary_velocity_x, void* temporary_velocity_y, void* temporary_velocity_z, void* temporary_previous_density, void* temporary_previous_velocity_x,
     void* temporary_previous_velocity_y, void* temporary_previous_velocity_z, void* temporary_pressure, void* temporary_divergence, float dt, float viscosity, float diffusion, int32_t diffuse_iterations, int32_t pressure_iterations, int32_t block_x, int32_t block_y, int32_t block_z, void* cuda_stream) {
