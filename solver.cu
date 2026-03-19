@@ -11,191 +11,237 @@ namespace stable_fluids {
 
     namespace {
 
-        [[nodiscard]] inline int32_t cuda_code(cudaError_t status) noexcept {
+        int32_t cuda_code(const cudaError_t status) noexcept {
             return status == cudaSuccess ? 0 : 5001;
         }
 
-        inline dim3 make_grid(int nx, int ny, int nz, const dim3& block) {
+        std::uint64_t scalar_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
+            return static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
+        }
+
+        std::uint64_t velocity_x_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
+            return static_cast<std::uint64_t>(nx + 1) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
+        }
+
+        std::uint64_t velocity_y_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
+            return static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny + 1) * static_cast<std::uint64_t>(nz) * sizeof(float);
+        }
+
+        std::uint64_t velocity_z_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
+            return static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz + 1) * sizeof(float);
+        }
+
+        dim3 make_grid(const int nx, const int ny, const int nz, const dim3& block) {
             return dim3(static_cast<unsigned>((nx + static_cast<int>(block.x) - 1) / static_cast<int>(block.x)), static_cast<unsigned>((ny + static_cast<int>(block.y) - 1) / static_cast<int>(block.y)), static_cast<unsigned>((nz + static_cast<int>(block.z) - 1) / static_cast<int>(block.z)));
         }
 
-        __host__ __device__ inline int ghosted_index(int x, int y, int z, int nx_total, int ny_total) {
-            return (z * ny_total + y) * nx_total + x;
+        __host__ __device__ int clampi(const int value, const int lo, const int hi) {
+            return value < lo ? lo : (value > hi ? hi : value);
         }
 
-        __device__ inline float clampf(float value, float lo, float hi) {
-            return fminf(fmaxf(value, lo), hi);
+        __host__ __device__ float clampf(const float value, const float lo, const float hi) {
+            return value < lo ? lo : (value > hi ? hi : value);
         }
 
-        __device__ inline float sample_trilinear(const float* field, float x, float y, float z, int nx, int ny, int nz, int nx_total, int ny_total) {
-            x = clampf(x, 0.5f, static_cast<float>(nx) + 0.5f);
-            y = clampf(y, 0.5f, static_cast<float>(ny) + 0.5f);
-            z = clampf(z, 0.5f, static_cast<float>(nz) + 0.5f);
-
-            const int x0 = static_cast<int>(floorf(x));
-            const int y0 = static_cast<int>(floorf(y));
-            const int z0 = static_cast<int>(floorf(z));
-            const int x1 = min(x0 + 1, nx + 1);
-            const int y1 = min(y0 + 1, ny + 1);
-            const int z1 = min(z0 + 1, nz + 1);
-
-            const float tx = x - static_cast<float>(x0);
-            const float ty = y - static_cast<float>(y0);
-            const float tz = z - static_cast<float>(z0);
-
-            const float c000 = field[ghosted_index(x0, y0, z0, nx_total, ny_total)];
-            const float c100 = field[ghosted_index(x1, y0, z0, nx_total, ny_total)];
-            const float c010 = field[ghosted_index(x0, y1, z0, nx_total, ny_total)];
-            const float c110 = field[ghosted_index(x1, y1, z0, nx_total, ny_total)];
-            const float c001 = field[ghosted_index(x0, y0, z1, nx_total, ny_total)];
-            const float c101 = field[ghosted_index(x1, y0, z1, nx_total, ny_total)];
-            const float c011 = field[ghosted_index(x0, y1, z1, nx_total, ny_total)];
-            const float c111 = field[ghosted_index(x1, y1, z1, nx_total, ny_total)];
-
-            const float c00 = c000 + tx * (c100 - c000);
-            const float c10 = c010 + tx * (c110 - c010);
-            const float c01 = c001 + tx * (c101 - c001);
-            const float c11 = c011 + tx * (c111 - c011);
-
-            const float c0 = c00 + ty * (c10 - c00);
-            const float c1 = c01 + ty * (c11 - c01);
-            return c0 + tz * (c1 - c0);
+        __host__ __device__ std::uint64_t index_3d(const int x, const int y, const int z, const int sx, const int sy) {
+            return static_cast<std::uint64_t>(z) * static_cast<std::uint64_t>(sx) * static_cast<std::uint64_t>(sy) + static_cast<std::uint64_t>(y) * static_cast<std::uint64_t>(sx) + static_cast<std::uint64_t>(x);
         }
 
-        __global__ void fill_kernel(float* field, float value, std::size_t count) {
-            const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx < count) field[idx] = value;
+        __device__ float fetch_clamped(const float* field, const int x, const int y, const int z, const int sx, const int sy, const int sz) {
+            return field[index_3d(clampi(x, 0, sx - 1), clampi(y, 0, sy - 1), clampi(z, 0, sz - 1), sx, sy)];
         }
 
-        __global__ void copy_compact_to_ghosted_kernel(float* ghosted, const float* compact, int nx, int ny, int nx_total, int ny_total, std::size_t count) {
-            const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= count) return;
+        __device__ float sample_grid(const float* field, float gx, float gy, float gz, const int sx, const int sy, const int sz) {
+            gx = clampf(gx, 0.0f, static_cast<float>(sx - 1));
+            gy = clampf(gy, 0.0f, static_cast<float>(sy - 1));
+            gz = clampf(gz, 0.0f, static_cast<float>(sz - 1));
 
-            const std::size_t plane                                         = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny);
-            const int z                                                     = static_cast<int>(idx / plane);
-            const std::size_t rem                                           = idx % plane;
-            const int y                                                     = static_cast<int>(rem / static_cast<std::size_t>(nx));
-            const int x                                                     = static_cast<int>(rem % static_cast<std::size_t>(nx));
-            ghosted[ghosted_index(x + 1, y + 1, z + 1, nx_total, ny_total)] = compact[idx];
+            const int x0 = clampi(static_cast<int>(floorf(gx)), 0, sx - 1);
+            const int y0 = clampi(static_cast<int>(floorf(gy)), 0, sy - 1);
+            const int z0 = clampi(static_cast<int>(floorf(gz)), 0, sz - 1);
+            const int x1 = min(x0 + 1, sx - 1);
+            const int y1 = min(y0 + 1, sy - 1);
+            const int z1 = min(z0 + 1, sz - 1);
+            const float tx = gx - static_cast<float>(x0);
+            const float ty = gy - static_cast<float>(y0);
+            const float tz = gz - static_cast<float>(z0);
+
+            const float c000 = field[index_3d(x0, y0, z0, sx, sy)];
+            const float c100 = field[index_3d(x1, y0, z0, sx, sy)];
+            const float c010 = field[index_3d(x0, y1, z0, sx, sy)];
+            const float c110 = field[index_3d(x1, y1, z0, sx, sy)];
+            const float c001 = field[index_3d(x0, y0, z1, sx, sy)];
+            const float c101 = field[index_3d(x1, y0, z1, sx, sy)];
+            const float c011 = field[index_3d(x0, y1, z1, sx, sy)];
+            const float c111 = field[index_3d(x1, y1, z1, sx, sy)];
+
+            const float c00 = c000 + (c100 - c000) * tx;
+            const float c10 = c010 + (c110 - c010) * tx;
+            const float c01 = c001 + (c101 - c001) * tx;
+            const float c11 = c011 + (c111 - c011) * tx;
+            const float c0 = c00 + (c10 - c00) * ty;
+            const float c1 = c01 + (c11 - c01) * ty;
+            return c0 + (c1 - c0) * tz;
         }
 
-        __global__ void copy_ghosted_to_compact_kernel(float* compact, const float* ghosted, int nx, int ny, int nx_total, int ny_total, std::size_t count) {
-            const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= count) return;
-
-            const std::size_t plane = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny);
-            const int z             = static_cast<int>(idx / plane);
-            const std::size_t rem   = idx % plane;
-            const int y             = static_cast<int>(rem / static_cast<std::size_t>(nx));
-            const int x             = static_cast<int>(rem % static_cast<std::size_t>(nx));
-            compact[idx]            = ghosted[ghosted_index(x + 1, y + 1, z + 1, nx_total, ny_total)];
+        __device__ float sample_scalar(const float* field, const float3 pos, const int nx, const int ny, const int nz, const float h) {
+            return sample_grid(field, pos.x / h - 0.5f, pos.y / h - 0.5f, pos.z / h - 0.5f, nx, ny, nz);
         }
 
-        __global__ void set_boundary_kernel(int field_kind, float* field, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
-            if (i >= nx + 2 || j >= ny + 2 || k >= nz + 2) return;
+        __device__ float sample_u(const float* field, const float3 pos, const int nx, const int ny, const int nz, const float h) {
+            return sample_grid(field, pos.x / h, pos.y / h - 0.5f, pos.z / h - 0.5f, nx + 1, ny, nz);
+        }
 
-            if (i > 0 && i < nx + 1 && j > 0 && j < ny + 1 && k > 0 && k < nz + 1) return;
+        __device__ float sample_v(const float* field, const float3 pos, const int nx, const int ny, const int nz, const float h) {
+            return sample_grid(field, pos.x / h - 0.5f, pos.y / h, pos.z / h - 0.5f, nx, ny + 1, nz);
+        }
 
-            const int ii = min(max(i, 1), nx);
-            const int jj = min(max(j, 1), ny);
-            const int kk = min(max(k, 1), nz);
+        __device__ float sample_w(const float* field, const float3 pos, const int nx, const int ny, const int nz, const float h) {
+            return sample_grid(field, pos.x / h - 0.5f, pos.y / h - 0.5f, pos.z / h, nx, ny, nz + 1);
+        }
 
-            float sign_sum = 0.0f;
-            int sign_count = 0;
-            if (i == 0 || i == nx + 1) {
-                sign_sum += field_kind == 1 ? -1.0f : 1.0f;
-                ++sign_count;
+        __device__ float3 clamp_domain(const float3 pos, const int nx, const int ny, const int nz, const float h) {
+            return make_float3(clampf(pos.x, 0.0f, static_cast<float>(nx) * h), clampf(pos.y, 0.0f, static_cast<float>(ny) * h), clampf(pos.z, 0.0f, static_cast<float>(nz) * h));
+        }
+
+        __device__ float3 sample_velocity(const float* velocity_x, const float* velocity_y, const float* velocity_z, float3 pos, const int nx, const int ny, const int nz, const float h) {
+            pos = clamp_domain(pos, nx, ny, nz, h);
+            return make_float3(sample_u(velocity_x, pos, nx, ny, nz, h), sample_v(velocity_y, pos, nx, ny, nz, h), sample_w(velocity_z, pos, nx, ny, nz, h));
+        }
+
+        __global__ void set_u_boundary_kernel(float* velocity_x, const int nx, const int ny, const int nz) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x <= nx && y < ny && z < nz && (x == 0 || x == nx)) velocity_x[index_3d(x, y, z, nx + 1, ny)] = 0.0f;
+        }
+
+        __global__ void set_v_boundary_kernel(float* velocity_y, const int nx, const int ny, const int nz) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x < nx && y <= ny && z < nz && (y == 0 || y == ny)) velocity_y[index_3d(x, y, z, nx, ny + 1)] = 0.0f;
+        }
+
+        __global__ void set_w_boundary_kernel(float* velocity_z, const int nx, const int ny, const int nz) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x < nx && y < ny && z <= nz && (z == 0 || z == nz)) velocity_z[index_3d(x, y, z, nx, ny)] = 0.0f;
+        }
+
+        __global__ void advect_u_kernel(float* destination, const float* source_x, const float* source_y, const float* source_z, const int nx, const int ny, const int nz, const float h, const float dt) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x > nx || y >= ny || z >= nz) return;
+            const float3 pos = make_float3(static_cast<float>(x) * h, (static_cast<float>(y) + 0.5f) * h, (static_cast<float>(z) + 0.5f) * h);
+            const float3 velocity = sample_velocity(source_x, source_y, source_z, pos, nx, ny, nz, h);
+            destination[index_3d(x, y, z, nx + 1, ny)] = sample_u(source_x, clamp_domain(make_float3(pos.x - dt * velocity.x, pos.y - dt * velocity.y, pos.z - dt * velocity.z), nx, ny, nz, h), nx, ny, nz, h);
+        }
+
+        __global__ void advect_v_kernel(float* destination, const float* source_x, const float* source_y, const float* source_z, const int nx, const int ny, const int nz, const float h, const float dt) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x >= nx || y > ny || z >= nz) return;
+            const float3 pos = make_float3((static_cast<float>(x) + 0.5f) * h, static_cast<float>(y) * h, (static_cast<float>(z) + 0.5f) * h);
+            const float3 velocity = sample_velocity(source_x, source_y, source_z, pos, nx, ny, nz, h);
+            destination[index_3d(x, y, z, nx, ny + 1)] = sample_v(source_y, clamp_domain(make_float3(pos.x - dt * velocity.x, pos.y - dt * velocity.y, pos.z - dt * velocity.z), nx, ny, nz, h), nx, ny, nz, h);
+        }
+
+        __global__ void advect_w_kernel(float* destination, const float* source_x, const float* source_y, const float* source_z, const int nx, const int ny, const int nz, const float h, const float dt) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x >= nx || y >= ny || z > nz) return;
+            const float3 pos = make_float3((static_cast<float>(x) + 0.5f) * h, (static_cast<float>(y) + 0.5f) * h, static_cast<float>(z) * h);
+            const float3 velocity = sample_velocity(source_x, source_y, source_z, pos, nx, ny, nz, h);
+            destination[index_3d(x, y, z, nx, ny)] = sample_w(source_z, clamp_domain(make_float3(pos.x - dt * velocity.x, pos.y - dt * velocity.y, pos.z - dt * velocity.z), nx, ny, nz, h), nx, ny, nz, h);
+        }
+
+        __global__ void advect_scalar_kernel(float* destination, const float* source, const float* velocity_x, const float* velocity_y, const float* velocity_z, const int nx, const int ny, const int nz, const float h, const float dt) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x >= nx || y >= ny || z >= nz) return;
+            const float3 pos = make_float3((static_cast<float>(x) + 0.5f) * h, (static_cast<float>(y) + 0.5f) * h, (static_cast<float>(z) + 0.5f) * h);
+            const float3 velocity = sample_velocity(velocity_x, velocity_y, velocity_z, pos, nx, ny, nz, h);
+            destination[index_3d(x, y, z, nx, ny)] = fmaxf(0.0f, sample_scalar(source, clamp_domain(make_float3(pos.x - dt * velocity.x, pos.y - dt * velocity.y, pos.z - dt * velocity.z), nx, ny, nz, h), nx, ny, nz, h));
+        }
+
+        __global__ void diffuse_grid_kernel(float* destination, const float* source, const int sx, const int sy, const int sz, const float alpha, const float denom, const int parity) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x >= sx || y >= sy || z >= sz || ((x + y + z) & 1) != parity) return;
+            const float neighbors = fetch_clamped(destination, x - 1, y, z, sx, sy, sz) + fetch_clamped(destination, x + 1, y, z, sx, sy, sz) + fetch_clamped(destination, x, y - 1, z, sx, sy, sz) + fetch_clamped(destination, x, y + 1, z, sx, sy, sz) + fetch_clamped(destination, x, y, z - 1, sx, sy, sz) + fetch_clamped(destination, x, y, z + 1, sx, sy, sz);
+            destination[index_3d(x, y, z, sx, sy)] = (source[index_3d(x, y, z, sx, sy)] + alpha * neighbors) / denom;
+        }
+
+        __global__ void compute_divergence_kernel(float* divergence, const float* velocity_x, const float* velocity_y, const float* velocity_z, const int nx, const int ny, const int nz, const float h) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x >= nx || y >= ny || z >= nz) return;
+            divergence[index_3d(x, y, z, nx, ny)] = (fetch_clamped(velocity_x, x + 1, y, z, nx + 1, ny, nz) - fetch_clamped(velocity_x, x, y, z, nx + 1, ny, nz) + fetch_clamped(velocity_y, x, y + 1, z, nx, ny + 1, nz) - fetch_clamped(velocity_y, x, y, z, nx, ny + 1, nz)
+                + fetch_clamped(velocity_z, x, y, z + 1, nx, ny, nz + 1) - fetch_clamped(velocity_z, x, y, z, nx, ny, nz + 1)) / h;
+        }
+
+        __global__ void pressure_rbgs_kernel(float* pressure, const float* divergence, const int nx, const int ny, const int nz, const float h, const int parity) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x >= nx || y >= ny || z >= nz || ((x + y + z) & 1) != parity) return;
+
+            float sum = 0.0f;
+            int count = 0;
+            if (x > 0) {
+                sum += pressure[index_3d(x - 1, y, z, nx, ny)];
+                ++count;
             }
-            if (j == 0 || j == ny + 1) {
-                sign_sum += field_kind == 2 ? -1.0f : 1.0f;
-                ++sign_count;
+            if (x + 1 < nx) {
+                sum += pressure[index_3d(x + 1, y, z, nx, ny)];
+                ++count;
             }
-            if (k == 0 || k == nz + 1) {
-                sign_sum += field_kind == 3 ? -1.0f : 1.0f;
-                ++sign_count;
+            if (y > 0) {
+                sum += pressure[index_3d(x, y - 1, z, nx, ny)];
+                ++count;
             }
-
-            const int dst = ghosted_index(i, j, k, nx_total, ny_total);
-            const int src = ghosted_index(ii, jj, kk, nx_total, ny_total);
-            field[dst]    = field[src] * (sign_sum / static_cast<float>(max(sign_count, 1)));
+            if (y + 1 < ny) {
+                sum += pressure[index_3d(x, y + 1, z, nx, ny)];
+                ++count;
+            }
+            if (z > 0) {
+                sum += pressure[index_3d(x, y, z - 1, nx, ny)];
+                ++count;
+            }
+            if (z + 1 < nz) {
+                sum += pressure[index_3d(x, y, z + 1, nx, ny)];
+                ++count;
+            }
+            pressure[index_3d(x, y, z, nx, ny)] = count > 0 ? (sum - divergence[index_3d(x, y, z, nx, ny)] * h * h) / static_cast<float>(count) : 0.0f;
         }
 
-        __global__ void advect_scalar_kernel(float* dst, const float* src, const float* u, const float* v, const float* w, float dt_over_h, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) return;
-
-            const int idx      = ghosted_index(i, j, k, nx_total, ny_total);
-            const float back_x = static_cast<float>(i) - dt_over_h * u[idx];
-            const float back_y = static_cast<float>(j) - dt_over_h * v[idx];
-            const float back_z = static_cast<float>(k) - dt_over_h * w[idx];
-            dst[idx]           = sample_trilinear(src, back_x, back_y, back_z, nx, ny, nz, nx_total, ny_total);
+        __global__ void subtract_gradient_u_kernel(float* velocity_x, const float* pressure, const int nx, const int ny, const int nz, const float h) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x > 0 && x < nx && y < ny && z < nz) velocity_x[index_3d(x, y, z, nx + 1, ny)] -= (pressure[index_3d(x, y, z, nx, ny)] - pressure[index_3d(x - 1, y, z, nx, ny)]) / h;
         }
 
-        __global__ void advect_velocity_kernel(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel, float dt_over_h, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) return;
-
-            const int idx      = ghosted_index(i, j, k, nx_total, ny_total);
-            const float back_x = static_cast<float>(i) - dt_over_h * u_vel[idx];
-            const float back_y = static_cast<float>(j) - dt_over_h * v_vel[idx];
-            const float back_z = static_cast<float>(k) - dt_over_h * w_vel[idx];
-
-            u_dst[idx] = sample_trilinear(u_src, back_x, back_y, back_z, nx, ny, nz, nx_total, ny_total);
-            v_dst[idx] = sample_trilinear(v_src, back_x, back_y, back_z, nx, ny, nz, nx_total, ny_total);
-            w_dst[idx] = sample_trilinear(w_src, back_x, back_y, back_z, nx, ny, nz, nx_total, ny_total);
+        __global__ void subtract_gradient_v_kernel(float* velocity_y, const float* pressure, const int nx, const int ny, const int nz, const float h) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x < nx && y > 0 && y < ny && z < nz) velocity_y[index_3d(x, y, z, nx, ny + 1)] -= (pressure[index_3d(x, y, z, nx, ny)] - pressure[index_3d(x, y - 1, z, nx, ny)]) / h;
         }
 
-        __global__ void rbgs_diffuse_kernel(float* dst, const float* src, float alpha, float denom, int parity, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz || ((i + j + k) & 1) != parity) return;
-
-            const int idx         = ghosted_index(i, j, k, nx_total, ny_total);
-            const float neighbors = dst[ghosted_index(i - 1, j, k, nx_total, ny_total)] + dst[ghosted_index(i + 1, j, k, nx_total, ny_total)] + dst[ghosted_index(i, j - 1, k, nx_total, ny_total)] + dst[ghosted_index(i, j + 1, k, nx_total, ny_total)] + dst[ghosted_index(i, j, k - 1, nx_total, ny_total)] + dst[ghosted_index(i, j, k + 1, nx_total, ny_total)];
-            dst[idx]              = (src[idx] + alpha * neighbors) / denom;
-        }
-
-        __global__ void divergence_kernel(float* divergence, const float* u, const float* v, const float* w, float half_inv_h, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) return;
-
-            const int idx = ghosted_index(i, j, k, nx_total, ny_total);
-            divergence[idx] =
-                half_inv_h * ((u[ghosted_index(i + 1, j, k, nx_total, ny_total)] - u[ghosted_index(i - 1, j, k, nx_total, ny_total)]) + (v[ghosted_index(i, j + 1, k, nx_total, ny_total)] - v[ghosted_index(i, j - 1, k, nx_total, ny_total)]) + (w[ghosted_index(i, j, k + 1, nx_total, ny_total)] - w[ghosted_index(i, j, k - 1, nx_total, ny_total)]));
-        }
-
-        __global__ void rbgs_pressure_kernel(float* pressure, const float* divergence, float h2, int parity, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz || ((i + j + k) & 1) != parity) return;
-
-            const int idx         = ghosted_index(i, j, k, nx_total, ny_total);
-            const float neighbors = pressure[ghosted_index(i - 1, j, k, nx_total, ny_total)] + pressure[ghosted_index(i + 1, j, k, nx_total, ny_total)] + pressure[ghosted_index(i, j - 1, k, nx_total, ny_total)] + pressure[ghosted_index(i, j + 1, k, nx_total, ny_total)] + pressure[ghosted_index(i, j, k - 1, nx_total, ny_total)]
-                                  + pressure[ghosted_index(i, j, k + 1, nx_total, ny_total)];
-            pressure[idx] = (neighbors - divergence[idx] * h2) / 6.0f;
-        }
-
-        __global__ void subtract_gradient_kernel(float* u, float* v, float* w, const float* pressure, float half_inv_h, int nx, int ny, int nz, int nx_total, int ny_total) {
-            const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) + 1;
-            const int j = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y) + 1;
-            const int k = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z) + 1;
-            if (i > nx || j > ny || k > nz) return;
-
-            const int idx = ghosted_index(i, j, k, nx_total, ny_total);
-            u[idx] -= half_inv_h * (pressure[ghosted_index(i + 1, j, k, nx_total, ny_total)] - pressure[ghosted_index(i - 1, j, k, nx_total, ny_total)]);
-            v[idx] -= half_inv_h * (pressure[ghosted_index(i, j + 1, k, nx_total, ny_total)] - pressure[ghosted_index(i, j - 1, k, nx_total, ny_total)]);
-            w[idx] -= half_inv_h * (pressure[ghosted_index(i, j, k + 1, nx_total, ny_total)] - pressure[ghosted_index(i, j, k - 1, nx_total, ny_total)]);
+        __global__ void subtract_gradient_w_kernel(float* velocity_z, const float* pressure, const int nx, const int ny, const int nz, const float h) {
+            const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+            const int z = static_cast<int>(blockIdx.z * blockDim.z + threadIdx.z);
+            if (x < nx && y < ny && z > 0 && z < nz) velocity_z[index_3d(x, y, z, nx, ny)] -= (pressure[index_3d(x, y, z, nx, ny)] - pressure[index_3d(x, y, z - 1, nx, ny)]) / h;
         }
 
     } // namespace
@@ -204,7 +250,7 @@ namespace stable_fluids {
 
 namespace {
 
-    [[nodiscard]] stable_fluids::Stream to_stream(void* cuda_stream) noexcept {
+    stable_fluids::Stream to_stream(void* cuda_stream) noexcept {
         return reinterpret_cast<stable_fluids::Stream>(cuda_stream);
     }
 
@@ -220,13 +266,10 @@ int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity
     if (dt <= 0.0f) return 1003;
     if (diffuse_iterations <= 0 || pressure_iterations <= 0) return 1004;
 
-    const auto interior_cell_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
-    const int nx_total             = nx + 2;
-    const int ny_total             = ny + 2;
-    const int nz_total             = nz + 2;
-    const auto total_cell_count    = static_cast<std::size_t>(nx_total) * static_cast<std::size_t>(ny_total) * static_cast<std::size_t>(nz_total);
-    const auto ghosted_field_bytes = total_cell_count * sizeof(float);
-
+    const auto cell_bytes = scalar_bytes(nx, ny, nz);
+    const auto velocity_x_field_bytes = velocity_x_bytes(nx, ny, nz);
+    const auto velocity_y_field_bytes = velocity_y_bytes(nx, ny, nz);
+    const auto velocity_z_field_bytes = velocity_z_bytes(nx, ny, nz);
     if (density == nullptr) return 2001;
     if (velocity_x == nullptr) return 2003;
     if (velocity_y == nullptr) return 2004;
@@ -242,163 +285,109 @@ int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity
     if (temporary_pressure == nullptr) return 2015;
     if (temporary_divergence == nullptr) return 2016;
 
-    auto* density_g       = reinterpret_cast<float*>(temporary_density);
-    auto* u_g             = reinterpret_cast<float*>(temporary_velocity_x);
-    auto* v_g             = reinterpret_cast<float*>(temporary_velocity_y);
-    auto* w_g             = reinterpret_cast<float*>(temporary_velocity_z);
-    auto* density_prev    = reinterpret_cast<float*>(temporary_previous_density);
-    auto* u_prev          = reinterpret_cast<float*>(temporary_previous_velocity_x);
-    auto* v_prev          = reinterpret_cast<float*>(temporary_previous_velocity_y);
-    auto* w_prev          = reinterpret_cast<float*>(temporary_previous_velocity_z);
-    auto* pressure        = reinterpret_cast<float*>(temporary_pressure);
-    auto* divergence      = reinterpret_cast<float*>(temporary_divergence);
-    auto* density_compact = reinterpret_cast<float*>(density);
-    auto* u_compact       = reinterpret_cast<float*>(velocity_x);
-    auto* v_compact       = reinterpret_cast<float*>(velocity_y);
-    auto* w_compact       = reinterpret_cast<float*>(velocity_z);
+    auto* density_field = reinterpret_cast<float*>(density);
+    auto* density_temporary = reinterpret_cast<float*>(temporary_density);
+    auto* density_previous = reinterpret_cast<float*>(temporary_previous_density);
+    auto* velocity_x_field = reinterpret_cast<float*>(velocity_x);
+    auto* velocity_y_field = reinterpret_cast<float*>(velocity_y);
+    auto* velocity_z_field = reinterpret_cast<float*>(velocity_z);
+    auto* velocity_x_temporary = reinterpret_cast<float*>(temporary_velocity_x);
+    auto* velocity_y_temporary = reinterpret_cast<float*>(temporary_velocity_y);
+    auto* velocity_z_temporary = reinterpret_cast<float*>(temporary_velocity_z);
+    auto* velocity_x_previous = reinterpret_cast<float*>(temporary_previous_velocity_x);
+    auto* velocity_y_previous = reinterpret_cast<float*>(temporary_previous_velocity_y);
+    auto* velocity_z_previous = reinterpret_cast<float*>(temporary_previous_velocity_z);
+    auto* pressure = reinterpret_cast<float*>(temporary_pressure);
+    auto* divergence = reinterpret_cast<float*>(temporary_divergence);
     const dim3 block{static_cast<unsigned>(std::max(block_x, 1)), static_cast<unsigned>(std::max(block_y, 1)), static_cast<unsigned>(std::max(block_z, 1))};
-    const dim3 interior_grid        = make_grid(nx, ny, nz, block);
-    const dim3 ghost_grid           = make_grid(nx_total, ny_total, nz_total, block);
-    const auto stream               = to_stream(cuda_stream);
-    constexpr int linear_block_size = 256;
-    const int fill_grid             = static_cast<int>((total_cell_count + linear_block_size - 1) / linear_block_size);
-    const int compact_grid          = static_cast<int>((interior_cell_count + linear_block_size - 1) / linear_block_size);
-    const float dt_over_h           = dt / cell_size;
+    const dim3 cells = make_grid(nx, ny, nz, block);
+    const dim3 u_grid = make_grid(nx + 1, ny, nz, block);
+    const dim3 v_grid = make_grid(nx, ny + 1, nz, block);
+    const dim3 w_grid = make_grid(nx, ny, nz + 1, block);
+    const auto stream = to_stream(cuda_stream);
 
     nvtx3::scoped_range step_range{"stable.step"};
-    fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(density_g, 0.0f, total_cell_count);
-    fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(u_g, 0.0f, total_cell_count);
-    fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(v_g, 0.0f, total_cell_count);
-    fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(w_g, 0.0f, total_cell_count);
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
-    copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(density_g, density_compact, nx, ny, nx_total, ny_total, interior_cell_count);
-    copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(u_g, u_compact, nx, ny, nx_total, ny_total, interior_cell_count);
-    copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(v_g, v_compact, nx, ny, nx_total, ny_total, interior_cell_count);
-    copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(w_g, w_compact, nx, ny, nx_total, ny_total, interior_cell_count);
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
-    set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-    set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
-    set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
-    set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
     {
         nvtx3::scoped_range range{"stable.step.advect_velocity"};
-        advect_velocity_kernel<<<interior_grid, block, 0, stream>>>(u_prev, v_prev, w_prev, u_g, v_g, w_g, u_g, v_g, w_g, dt_over_h, nx, ny, nz, nx_total, ny_total);
-        if (cuda_code(cudaGetLastError()) != 0) {
-            return 5001;
-        }
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_prev, nx, ny, nz, nx_total, ny_total);
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_prev, nx, ny, nz, nx_total, ny_total);
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_prev, nx, ny, nz, nx_total, ny_total);
-        if (cuda_code(cudaGetLastError()) != 0) {
-            return 5001;
-        }
+        if (cuda_code(cudaMemcpyAsync(velocity_x_previous, velocity_x_field, velocity_x_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+        if (cuda_code(cudaMemcpyAsync(velocity_y_previous, velocity_y_field, velocity_y_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+        if (cuda_code(cudaMemcpyAsync(velocity_z_previous, velocity_z_field, velocity_z_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+        advect_u_kernel<<<u_grid, block, 0, stream>>>(velocity_x_temporary, velocity_x_previous, velocity_y_previous, velocity_z_previous, nx, ny, nz, cell_size, dt);
+        advect_v_kernel<<<v_grid, block, 0, stream>>>(velocity_y_temporary, velocity_x_previous, velocity_y_previous, velocity_z_previous, nx, ny, nz, cell_size, dt);
+        advect_w_kernel<<<w_grid, block, 0, stream>>>(velocity_z_temporary, velocity_x_previous, velocity_y_previous, velocity_z_previous, nx, ny, nz, cell_size, dt);
+        set_u_boundary_kernel<<<u_grid, block, 0, stream>>>(velocity_x_temporary, nx, ny, nz);
+        set_v_boundary_kernel<<<v_grid, block, 0, stream>>>(velocity_y_temporary, nx, ny, nz);
+        set_w_boundary_kernel<<<w_grid, block, 0, stream>>>(velocity_z_temporary, nx, ny, nz);
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
     }
     {
         nvtx3::scoped_range range{"stable.step.diffuse_velocity"};
         if (viscosity <= 0.0f) {
-            if (cuda_code(cudaMemcpyAsync(u_g, u_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
-            if (cuda_code(cudaMemcpyAsync(v_g, v_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
-            if (cuda_code(cudaMemcpyAsync(w_g, w_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(velocity_x_field, velocity_x_temporary, velocity_x_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(velocity_y_field, velocity_y_temporary, velocity_y_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(velocity_z_field, velocity_z_temporary, velocity_z_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
         } else {
-            if (cuda_code(cudaMemcpyAsync(u_g, u_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
-            if (cuda_code(cudaMemcpyAsync(v_g, v_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
-            if (cuda_code(cudaMemcpyAsync(w_g, w_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(velocity_x_field, velocity_x_temporary, velocity_x_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(velocity_y_field, velocity_y_temporary, velocity_y_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(velocity_z_field, velocity_z_temporary, velocity_z_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
             const float alpha = dt * viscosity / (cell_size * cell_size);
             const float denom = 1.0f + 6.0f * alpha;
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
             for (int iteration = 0; iteration < diffuse_iterations; ++iteration) {
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(u_g, u_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(v_g, v_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(w_g, w_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
+                diffuse_grid_kernel<<<u_grid, block, 0, stream>>>(velocity_x_field, velocity_x_temporary, nx + 1, ny, nz, alpha, denom, 0);
+                diffuse_grid_kernel<<<v_grid, block, 0, stream>>>(velocity_y_field, velocity_y_temporary, nx, ny + 1, nz, alpha, denom, 0);
+                diffuse_grid_kernel<<<w_grid, block, 0, stream>>>(velocity_z_field, velocity_z_temporary, nx, ny, nz + 1, alpha, denom, 0);
+                set_u_boundary_kernel<<<u_grid, block, 0, stream>>>(velocity_x_field, nx, ny, nz);
+                set_v_boundary_kernel<<<v_grid, block, 0, stream>>>(velocity_y_field, nx, ny, nz);
+                set_w_boundary_kernel<<<w_grid, block, 0, stream>>>(velocity_z_field, nx, ny, nz);
                 if (cuda_code(cudaGetLastError()) != 0) return 5001;
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-                if (cuda_code(cudaGetLastError()) != 0) return 5001;
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(u_g, u_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(v_g, v_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(w_g, w_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
-                if (cuda_code(cudaGetLastError()) != 0) return 5001;
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
+                diffuse_grid_kernel<<<u_grid, block, 0, stream>>>(velocity_x_field, velocity_x_temporary, nx + 1, ny, nz, alpha, denom, 1);
+                diffuse_grid_kernel<<<v_grid, block, 0, stream>>>(velocity_y_field, velocity_y_temporary, nx, ny + 1, nz, alpha, denom, 1);
+                diffuse_grid_kernel<<<w_grid, block, 0, stream>>>(velocity_z_field, velocity_z_temporary, nx, ny, nz + 1, alpha, denom, 1);
+                set_u_boundary_kernel<<<u_grid, block, 0, stream>>>(velocity_x_field, nx, ny, nz);
+                set_v_boundary_kernel<<<v_grid, block, 0, stream>>>(velocity_y_field, nx, ny, nz);
+                set_w_boundary_kernel<<<w_grid, block, 0, stream>>>(velocity_z_field, nx, ny, nz);
                 if (cuda_code(cudaGetLastError()) != 0) return 5001;
             }
         }
     }
     {
         nvtx3::scoped_range range{"stable.step.project"};
-        const float half_inv_h = 0.5f / cell_size;
-        const float h2         = cell_size * cell_size;
-        divergence_kernel<<<interior_grid, block, 0, stream>>>(divergence, u_g, v_g, w_g, half_inv_h, nx, ny, nz, nx_total, ny_total);
-        if (cuda_code(cudaGetLastError()) != 0) return 5001;
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, divergence, nx, ny, nz, nx_total, ny_total);
-        if (cuda_code(cudaGetLastError()) != 0) return 5001;
-        fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(pressure, 0.0f, total_cell_count);
-        if (cuda_code(cudaGetLastError()) != 0) return 5001;
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, pressure, nx, ny, nz, nx_total, ny_total);
-        if (cuda_code(cudaGetLastError()) != 0) return 5001;
+        if (cuda_code(cudaMemsetAsync(pressure, 0, cell_bytes, stream)) != 0) return 5001;
+        compute_divergence_kernel<<<cells, block, 0, stream>>>(divergence, velocity_x_field, velocity_y_field, velocity_z_field, nx, ny, nz, cell_size);
         for (int iteration = 0; iteration < pressure_iterations; ++iteration) {
-            rbgs_pressure_kernel<<<interior_grid, block, 0, stream>>>(pressure, divergence, h2, 0, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, pressure, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
-            rbgs_pressure_kernel<<<interior_grid, block, 0, stream>>>(pressure, divergence, h2, 1, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, pressure, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
+            pressure_rbgs_kernel<<<cells, block, 0, stream>>>(pressure, divergence, nx, ny, nz, cell_size, 0);
+            pressure_rbgs_kernel<<<cells, block, 0, stream>>>(pressure, divergence, nx, ny, nz, cell_size, 1);
         }
-        subtract_gradient_kernel<<<interior_grid, block, 0, stream>>>(u_g, v_g, w_g, pressure, half_inv_h, nx, ny, nz, nx_total, ny_total);
-        if (cuda_code(cudaGetLastError()) != 0) return 5001;
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
+        subtract_gradient_u_kernel<<<u_grid, block, 0, stream>>>(velocity_x_field, pressure, nx, ny, nz, cell_size);
+        subtract_gradient_v_kernel<<<v_grid, block, 0, stream>>>(velocity_y_field, pressure, nx, ny, nz, cell_size);
+        subtract_gradient_w_kernel<<<w_grid, block, 0, stream>>>(velocity_z_field, pressure, nx, ny, nz, cell_size);
+        set_u_boundary_kernel<<<u_grid, block, 0, stream>>>(velocity_x_field, nx, ny, nz);
+        set_v_boundary_kernel<<<v_grid, block, 0, stream>>>(velocity_y_field, nx, ny, nz);
+        set_w_boundary_kernel<<<w_grid, block, 0, stream>>>(velocity_z_field, nx, ny, nz);
         if (cuda_code(cudaGetLastError()) != 0) return 5001;
     }
     {
         nvtx3::scoped_range range{"stable.step.advect_density"};
-        advect_scalar_kernel<<<interior_grid, block, 0, stream>>>(density_prev, density_g, u_g, v_g, w_g, dt_over_h, nx, ny, nz, nx_total, ny_total);
-        if (cuda_code(cudaGetLastError()) != 0) return 5001;
-        set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_prev, nx, ny, nz, nx_total, ny_total);
+        if (cuda_code(cudaMemcpyAsync(density_previous, density_field, cell_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+        advect_scalar_kernel<<<cells, block, 0, stream>>>(density_temporary, density_previous, velocity_x_field, velocity_y_field, velocity_z_field, nx, ny, nz, cell_size, dt);
         if (cuda_code(cudaGetLastError()) != 0) return 5001;
     }
     {
         nvtx3::scoped_range range{"stable.step.diffuse_density"};
         if (diffusion <= 0.0f) {
-            if (cuda_code(cudaMemcpyAsync(density_g, density_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(density_field, density_temporary, cell_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
         } else {
-            if (cuda_code(cudaMemcpyAsync(density_g, density_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(density_field, density_temporary, cell_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
             const float alpha = dt * diffusion / (cell_size * cell_size);
             const float denom = 1.0f + 6.0f * alpha;
-            set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-            if (cuda_code(cudaGetLastError()) != 0) return 5001;
             for (int iteration = 0; iteration < diffuse_iterations; ++iteration) {
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(density_g, density_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
+                diffuse_grid_kernel<<<cells, block, 0, stream>>>(density_field, density_temporary, nx, ny, nz, alpha, denom, 0);
                 if (cuda_code(cudaGetLastError()) != 0) return 5001;
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-                if (cuda_code(cudaGetLastError()) != 0) return 5001;
-                rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(density_g, density_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
-                if (cuda_code(cudaGetLastError()) != 0) return 5001;
-                set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
+                diffuse_grid_kernel<<<cells, block, 0, stream>>>(density_field, density_temporary, nx, ny, nz, alpha, denom, 1);
                 if (cuda_code(cudaGetLastError()) != 0) return 5001;
             }
         }
     }
-    copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(density_compact, density_g, nx, ny, nx_total, ny_total, interior_cell_count);
-    copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(u_compact, u_g, nx, ny, nx_total, ny_total, interior_cell_count);
-    copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(v_compact, v_g, nx, ny, nx_total, ny_total, interior_cell_count);
-    copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(w_compact, w_g, nx, ny, nx_total, ny_total, interior_cell_count);
-    if (cuda_code(cudaGetLastError()) != 0) return 5001;
     return 0;
 }
 
