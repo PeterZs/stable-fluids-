@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STABLE_FLUIDS_H
+#define STABLE_FLUIDS_H
 
 #include <stdint.h>
 
@@ -100,3 +101,5 @@ STABLE_FLUIDS_API int32_t stable_fluids_copy_context_last_error(const StableFlui
 #ifdef __cplusplus
 }
 #endif
+
+#endif // STABLE_FLUIDS_H

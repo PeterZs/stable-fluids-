@@ -1,4 +1,4 @@
-#include "stable_fluids.h"
+#include "stable-fluids.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cuda_runtime.h>

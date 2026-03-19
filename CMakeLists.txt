@@ -26,7 +26,7 @@ set(CMAKE_CUDA_ARCHITECTURES native)
 add_library(
         stable-fluids
         SHARED
-        stable_fluids.h
+        stable-fluids.h
         solver.cu
 )
 
