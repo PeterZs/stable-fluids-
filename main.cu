@@ -92,19 +92,19 @@ int main() {
         return false;
     };
 
-    constexpr int32_t nx                  = 96;
-    constexpr int32_t ny                  = 96;
-    constexpr int32_t nz                  = 96;
+    constexpr int32_t nx                  = 48;
+    constexpr int32_t ny                  = 72;
+    constexpr int32_t nz                  = 48;
     constexpr float cell_size             = 1.0f;
-    constexpr float dt                    = 1.0f / 60.0f;
+    constexpr float dt                    = 1.0f / 90.0f;
     constexpr float viscosity             = 0.00015f;
     constexpr float diffusion             = 0.00005f;
     constexpr int32_t diffuse_iterations  = 24;
-    constexpr int32_t pressure_iterations = 96;
+    constexpr int32_t pressure_iterations = 80;
     constexpr int32_t block_x             = 8;
     constexpr int32_t block_y             = 8;
-    constexpr int32_t block_z             = 8;
-    constexpr int32_t frames              = 24;
+    constexpr int32_t block_z             = 4;
+    constexpr int32_t frames              = 16;
 
     const uint64_t scalar_bytes     = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
     const uint64_t velocity_x_bytes = static_cast<uint64_t>(nx + 1) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
@@ -199,7 +199,7 @@ int main() {
 
     const auto cpu_begin = std::chrono::steady_clock::now();
     for (int frame = 0; frame < frames; ++frame) {
-        if (frame < 8) add_source_cpu(cpu_density, cpu_velocity_x, cpu_velocity_y, cpu_velocity_z, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, frame == 0 ? 5.0f : 4.0f, frame == 0 ? 6.0f : 1.5f, frame == 0 ? 1.25f : 0.0f, frame == 0 ? 2.5f : 0.5f, frame == 0 ? 0.75f : 0.0f);
+        add_source_cpu(cpu_density, cpu_velocity_x, cpu_velocity_y, cpu_velocity_z, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.18f, static_cast<float>(nz) * 0.5f, 4.5f, 0.85f, 0.0f, 1.2f, 0.0f);
 
         StableFluidsStepDesc cpu_desc{};
         cpu_desc.struct_size                   = sizeof(StableFluidsStepDesc);
@@ -240,7 +240,7 @@ int main() {
 
     const auto parallel_begin = std::chrono::steady_clock::now();
     for (int frame = 0; frame < frames; ++frame) {
-        if (frame < 8) add_source_cpu(parallel_density, parallel_velocity_x, parallel_velocity_y, parallel_velocity_z, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, frame == 0 ? 5.0f : 4.0f, frame == 0 ? 6.0f : 1.5f, frame == 0 ? 1.25f : 0.0f, frame == 0 ? 2.5f : 0.5f, frame == 0 ? 0.75f : 0.0f);
+        add_source_cpu(parallel_density, parallel_velocity_x, parallel_velocity_y, parallel_velocity_z, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.18f, static_cast<float>(nz) * 0.5f, 4.5f, 0.85f, 0.0f, 1.2f, 0.0f);
 
         StableFluidsStepDesc parallel_desc{};
         parallel_desc.struct_size                   = sizeof(StableFluidsStepDesc);
@@ -319,19 +319,12 @@ int main() {
 
     const auto cuda_begin = std::chrono::steady_clock::now();
     for (int frame = 0; exit_code == EXIT_SUCCESS && frame < frames; ++frame) {
-        if (frame < 8) {
-            const float radius = frame == 0 ? 5.0f : 4.0f;
-            const float density_amount = frame == 0 ? 6.0f : 1.5f;
-            const float velocity_source_x = frame == 0 ? 1.25f : 0.0f;
-            const float velocity_source_y = frame == 0 ? 2.5f : 0.5f;
-            const float velocity_source_z = frame == 0 ? 0.75f : 0.0f;
-            const dim3 block{static_cast<unsigned>(block_x), static_cast<unsigned>(block_y), static_cast<unsigned>(block_z)};
-            source_cells_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(density, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, radius, density_amount, nx, ny, nz);
-            source_u_kernel<<<make_grid(nx + 1, ny, nz, block), block, 0, stream>>>(velocity_x, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, radius, velocity_source_x);
-            source_v_kernel<<<make_grid(nx, ny + 1, nz, block), block, 0, stream>>>(velocity_y, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, radius, velocity_source_y);
-            source_w_kernel<<<make_grid(nx, ny, nz + 1, block), block, 0, stream>>>(velocity_z, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, radius, velocity_source_z);
-            if (!cuda_ok(cudaGetLastError(), "source kernels")) exit_code = EXIT_FAILURE;
-        }
+        const dim3 block{static_cast<unsigned>(block_x), static_cast<unsigned>(block_y), static_cast<unsigned>(block_z)};
+        source_cells_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(density, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.18f, static_cast<float>(nz) * 0.5f, 4.5f, 0.85f, nx, ny, nz);
+        source_u_kernel<<<make_grid(nx + 1, ny, nz, block), block, 0, stream>>>(velocity_x, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.18f, static_cast<float>(nz) * 0.5f, 4.5f, 0.0f);
+        source_v_kernel<<<make_grid(nx, ny + 1, nz, block), block, 0, stream>>>(velocity_y, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.18f, static_cast<float>(nz) * 0.5f, 4.5f, 1.2f);
+        source_w_kernel<<<make_grid(nx, ny, nz + 1, block), block, 0, stream>>>(velocity_z, nx, ny, nz, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.18f, static_cast<float>(nz) * 0.5f, 4.5f, 0.0f);
+        if (!cuda_ok(cudaGetLastError(), "source kernels")) exit_code = EXIT_FAILURE;
 
         StableFluidsStepDesc cuda_desc{};
         cuda_desc.struct_size                   = sizeof(StableFluidsStepDesc);
