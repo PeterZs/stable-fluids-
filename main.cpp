@@ -1,4 +1,5 @@
 #include "stable-fluids.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -25,7 +26,6 @@ bool stable_ok(int32_t code, const char* what, const StableFluidsContext* contex
     const uint64_t message_length =
         context != nullptr ? stable_fluids_context_last_error_length(context) : stable_fluids_last_error_length();
     std::vector<char> message(static_cast<std::size_t>(message_length + 1), '\0');
-
     const int32_t copy_code = context != nullptr
         ? stable_fluids_copy_context_last_error(context, message.data(), static_cast<uint64_t>(message.size()))
         : stable_fluids_copy_last_error(message.data(), static_cast<uint64_t>(message.size()));
@@ -38,16 +38,7 @@ bool stable_ok(int32_t code, const char* what, const StableFluidsContext* contex
     return false;
 }
 
-StableFluidsBufferView make_f32_device_buffer(void* data, uint64_t size_bytes) {
-    StableFluidsBufferView view{};
-    view.data = data;
-    view.size_bytes = size_bytes;
-    view.format = STABLE_FLUIDS_BUFFER_FORMAT_F32;
-    view.memory_type = STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE;
-    return view;
-}
-
-}  // namespace
+} // namespace
 
 int main() {
     nvtx3::scoped_range app_range{"stable.demo"};
@@ -61,7 +52,6 @@ int main() {
     context_desc.diffusion = 0.00005f;
     context_desc.diffuse_iterations = 24;
     context_desc.pressure_iterations = 96;
-    context_desc.pressure_tolerance = 1.0e-5f;
 
     StableFluidsContext* context = stable_fluids_context_create(&context_desc);
     if (context == nullptr) {
@@ -70,7 +60,10 @@ int main() {
     }
 
     const uint64_t element_count = stable_fluids_context_required_elements(context);
-    const uint64_t field_bytes = stable_fluids_context_required_scalar_field_bytes(context);
+    const uint64_t scalar_bytes = stable_fluids_context_required_scalar_field_bytes(context);
+    const uint64_t velocity_x_bytes = stable_fluids_context_required_vector_field_component_bytes(context, VECTOR_FIELD_COMPONENT_X);
+    const uint64_t velocity_y_bytes = stable_fluids_context_required_vector_field_component_bytes(context, VECTOR_FIELD_COMPONENT_Y);
+    const uint64_t velocity_z_bytes = stable_fluids_context_required_vector_field_component_bytes(context, VECTOR_FIELD_COMPONENT_Z);
 
     float* density = nullptr;
     float* velocity_x = nullptr;
@@ -78,10 +71,10 @@ int main() {
     float* velocity_z = nullptr;
     cudaStream_t stream = nullptr;
 
-    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&density), field_bytes), "cudaMalloc density") ||
-        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_x), field_bytes), "cudaMalloc velocity_x") ||
-        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_y), field_bytes), "cudaMalloc velocity_y") ||
-        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_z), field_bytes), "cudaMalloc velocity_z")) {
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&density), scalar_bytes), "cudaMalloc density") ||
+        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_x), velocity_x_bytes), "cudaMalloc velocity_x") ||
+        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_y), velocity_y_bytes), "cudaMalloc velocity_y") ||
+        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_z), velocity_z_bytes), "cudaMalloc velocity_z")) {
         cudaFree(density);
         cudaFree(velocity_x);
         cudaFree(velocity_y);
@@ -99,11 +92,33 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    StableFluidsFieldSetDesc fields{};
-    fields.density = make_f32_device_buffer(density, field_bytes);
-    fields.velocity_x = make_f32_device_buffer(velocity_x, field_bytes);
-    fields.velocity_y = make_f32_device_buffer(velocity_y, field_bytes);
-    fields.velocity_z = make_f32_device_buffer(velocity_z, field_bytes);
+    const FieldGridDesc grid{
+        .nx = context_desc.nx,
+        .ny = context_desc.ny,
+        .nz = context_desc.nz,
+        .cell_size = context_desc.cell_size,
+    };
+    const auto make_buffer = [](void* data, uint64_t size_bytes) {
+        return FieldBufferView{
+            .data = data,
+            .size_bytes = size_bytes,
+            .format = FIELD_FORMAT_F32,
+            .memory_type = FIELD_MEMORY_TYPE_CUDA_DEVICE,
+        };
+    };
+    StableFluidsFieldSet fields{
+        .density = ScalarField{
+            .grid = grid,
+            .values = make_buffer(density, scalar_bytes),
+        },
+        .velocity = VectorField{
+            .grid = grid,
+            .layout = VECTOR_FIELD_LAYOUT_CELL_CENTERED,
+            .x = make_buffer(velocity_x, velocity_x_bytes),
+            .y = make_buffer(velocity_y, velocity_y_bytes),
+            .z = make_buffer(velocity_z, velocity_z_bytes),
+        },
+    };
 
     StableFluidsDensitySplatDesc density_splat{};
     density_splat.center_x = static_cast<float>(context_desc.nx) * 0.5f;
@@ -180,7 +195,7 @@ int main() {
     }
 
     std::vector<float> host_density(static_cast<std::size_t>(element_count), 0.0f);
-    if (!cuda_ok(cudaMemcpy(host_density.data(), density, field_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy density to host")) {
+    if (!cuda_ok(cudaMemcpy(host_density.data(), density, scalar_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy density to host")) {
         cudaStreamDestroy(stream);
         cudaFree(density);
         cudaFree(velocity_x);

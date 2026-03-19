@@ -12,8 +12,10 @@
 
 namespace stable_fluids {
     using SolverDesc   = StableFluidsContextDesc;
-    using BufferView   = StableFluidsBufferView;
-    using FieldSet     = StableFluidsFieldSetDesc;
+    using BufferView   = FieldBufferView;
+    using ScalarFieldT = ScalarField;
+    using VectorFieldT = VectorField;
+    using FieldSet     = StableFluidsFieldSet;
     using DensitySplat = StableFluidsDensitySplatDesc;
     using ForceSplat   = StableFluidsForceSplatDesc;
     using Stream       = cudaStream_t;
@@ -322,13 +324,14 @@ namespace stable_fluids {
 
         [[nodiscard]] std::uint64_t required_elements() const noexcept;
         [[nodiscard]] std::uint64_t required_scalar_field_bytes() const noexcept;
+        [[nodiscard]] std::uint64_t required_vector_field_component_bytes(uint32_t component) const noexcept;
 
         void zero_fields(const FieldSet& fields, Stream stream);
         void add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream);
         void add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream);
         void step(const FieldSet& fields, Stream stream);
-        void snapshot_density(const FieldSet& fields, const BufferView& destination, Stream stream);
-        void snapshot_velocity_magnitude(const FieldSet& fields, const BufferView& destination, Stream stream);
+        void snapshot_density(const FieldSet& fields, const ScalarFieldT& destination, Stream stream);
+        void snapshot_velocity_magnitude(const FieldSet& fields, const ScalarFieldT& destination, Stream stream);
 
     private:
         void validate_fields_(const FieldSet& fields) const;
@@ -430,26 +433,45 @@ namespace stable_fluids {
         return static_cast<std::uint64_t>(compact_bytes_);
     }
 
+    std::uint64_t Solver3D::required_vector_field_component_bytes(uint32_t component) const noexcept {
+        return component <= VECTOR_FIELD_COMPONENT_Z ? static_cast<std::uint64_t>(compact_bytes_) : 0;
+    }
+
     void Solver3D::validate_fields_(const FieldSet& fields) const {
+        const auto validate_grid = [this](const FieldGridDesc& grid, const char* name) {
+            if (grid.nx != desc_.nx || grid.ny != desc_.ny || grid.nz != desc_.nz) {
+                throw std::invalid_argument(std::string(name) + " grid dimensions must match the context");
+            }
+            if (std::fabs(grid.cell_size - desc_.cell_size) > 1.0e-6f) {
+                throw std::invalid_argument(std::string(name) + " cell_size must match the context");
+            }
+        };
+
         const auto validate_buffer = [this](const BufferView& view, const char* name) {
             if (view.data == nullptr) {
                 throw std::invalid_argument(std::string(name) + " must provide a non-null device pointer");
             }
-            if (view.format != STABLE_FLUIDS_BUFFER_FORMAT_F32) {
-                throw std::invalid_argument(std::string(name) + " must use STABLE_FLUIDS_BUFFER_FORMAT_F32");
+            if (view.format != FIELD_FORMAT_F32) {
+                throw std::invalid_argument(std::string(name) + " must use FIELD_FORMAT_F32");
             }
-            if (view.memory_type != STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE) {
-                throw std::invalid_argument(std::string(name) + " must use STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE");
+            if (view.memory_type != FIELD_MEMORY_TYPE_CUDA_DEVICE) {
+                throw std::invalid_argument(std::string(name) + " must use FIELD_MEMORY_TYPE_CUDA_DEVICE");
             }
             if (view.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
                 throw std::invalid_argument(std::string(name) + " size_bytes is smaller than nx*ny*nz*sizeof(float)");
             }
         };
 
-        validate_buffer(fields.density, "density");
-        validate_buffer(fields.velocity_x, "velocity_x");
-        validate_buffer(fields.velocity_y, "velocity_y");
-        validate_buffer(fields.velocity_z, "velocity_z");
+        validate_grid(fields.density.grid, "density");
+        validate_buffer(fields.density.values, "density.values");
+
+        validate_grid(fields.velocity.grid, "velocity");
+        if (fields.velocity.layout != VECTOR_FIELD_LAYOUT_CELL_CENTERED) {
+            throw std::invalid_argument("velocity.layout must be VECTOR_FIELD_LAYOUT_CELL_CENTERED");
+        }
+        validate_buffer(fields.velocity.x, "velocity.x");
+        validate_buffer(fields.velocity.y, "velocity.y");
+        validate_buffer(fields.velocity.z, "velocity.z");
     }
 
     void Solver3D::fill_field_(float* field, float value, Stream stream) {
@@ -490,10 +512,10 @@ namespace stable_fluids {
     void Solver3D::zero_fields(const FieldSet& fields, Stream stream) {
         nvtx3::scoped_range range{"stable.clear"};
         validate_fields_(fields);
-        zero_compact_field_(reinterpret_cast<float*>(fields.density.data), stream);
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_x.data), stream);
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_y.data), stream);
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity_z.data), stream);
+        zero_compact_field_(reinterpret_cast<float*>(fields.density.values.data), stream);
+        zero_compact_field_(reinterpret_cast<float*>(fields.velocity.x.data), stream);
+        zero_compact_field_(reinterpret_cast<float*>(fields.velocity.y.data), stream);
+        zero_compact_field_(reinterpret_cast<float*>(fields.velocity.z.data), stream);
     }
 
     void Solver3D::add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream) {
@@ -501,7 +523,7 @@ namespace stable_fluids {
         validate_fields_(fields);
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        splat_density_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.density.data), x, y, z, fmaxf(radius, 1.0f), amount, desc_.nx, desc_.ny, desc_.nz);
+        splat_density_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.density.values.data), x, y, z, fmaxf(radius, 1.0f), amount, desc_.nx, desc_.ny, desc_.nz);
         check_cuda(cudaGetLastError(), "splat_density_compact_kernel launch");
     }
 
@@ -510,7 +532,7 @@ namespace stable_fluids {
         validate_fields_(fields);
         const dim3 block = make_block(desc_);
         const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        splat_force_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.velocity_x.data), reinterpret_cast<float*>(fields.velocity_y.data), reinterpret_cast<float*>(fields.velocity_z.data), x, y, z, fmaxf(radius, 1.0f), fx, fy, fz, desc_.nx, desc_.ny, desc_.nz);
+        splat_force_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.velocity.x.data), reinterpret_cast<float*>(fields.velocity.y.data), reinterpret_cast<float*>(fields.velocity.z.data), x, y, z, fmaxf(radius, 1.0f), fx, fy, fz, desc_.nx, desc_.ny, desc_.nz);
         check_cuda(cudaGetLastError(), "splat_force_compact_kernel launch");
     }
 
@@ -639,10 +661,10 @@ namespace stable_fluids {
         nvtx3::scoped_range step_range{"stable.step"};
         validate_fields_(fields);
 
-        copy_compact_to_ghosted_(density_, reinterpret_cast<const float*>(fields.density.data), stream);
-        copy_compact_to_ghosted_(u_, reinterpret_cast<const float*>(fields.velocity_x.data), stream);
-        copy_compact_to_ghosted_(v_, reinterpret_cast<const float*>(fields.velocity_y.data), stream);
-        copy_compact_to_ghosted_(w_, reinterpret_cast<const float*>(fields.velocity_z.data), stream);
+        copy_compact_to_ghosted_(density_, reinterpret_cast<const float*>(fields.density.values.data), stream);
+        copy_compact_to_ghosted_(u_, reinterpret_cast<const float*>(fields.velocity.x.data), stream);
+        copy_compact_to_ghosted_(v_, reinterpret_cast<const float*>(fields.velocity.y.data), stream);
+        copy_compact_to_ghosted_(w_, reinterpret_cast<const float*>(fields.velocity.z.data), stream);
 
         set_boundary_(0, density_, stream);
         set_boundary_(1, u_, stream);
@@ -668,56 +690,68 @@ namespace stable_fluids {
             diffuse_scalar_(density_, density_prev_, stream);
         }
 
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.density.data), density_, stream);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_x.data), u_, stream);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_y.data), v_, stream);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity_z.data), w_, stream);
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.density.values.data), density_, stream);
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity.x.data), u_, stream);
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity.y.data), v_, stream);
+        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity.z.data), w_, stream);
     }
 
-    void Solver3D::snapshot_density(const FieldSet& fields, const BufferView& destination, Stream stream) {
+    void Solver3D::snapshot_density(const FieldSet& fields, const ScalarFieldT& destination, Stream stream) {
         nvtx3::scoped_range range{"stable.snapshot_density"};
         validate_fields_(fields);
-        if (destination.data == nullptr) {
-            throw std::invalid_argument("snapshot destination must provide a non-null device pointer");
+        if (destination.grid.nx != desc_.nx || destination.grid.ny != desc_.ny || destination.grid.nz != desc_.nz) {
+            throw std::invalid_argument("snapshot density destination grid dimensions must match the context");
         }
-        if (destination.format != STABLE_FLUIDS_BUFFER_FORMAT_F32) {
-            throw std::invalid_argument("snapshot destination must use STABLE_FLUIDS_BUFFER_FORMAT_F32");
+        if (std::fabs(destination.grid.cell_size - desc_.cell_size) > 1.0e-6f) {
+            throw std::invalid_argument("snapshot density destination cell_size must match the context");
         }
-        if (destination.memory_type != STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE) {
-            throw std::invalid_argument("snapshot destination must use STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE");
+        if (destination.values.data == nullptr) {
+            throw std::invalid_argument("snapshot density destination must provide a non-null device pointer");
         }
-        if (destination.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
-            throw std::invalid_argument("snapshot destination size_bytes is smaller than nx*ny*nz*sizeof(float)");
+        if (destination.values.format != FIELD_FORMAT_F32) {
+            throw std::invalid_argument("snapshot density destination must use FIELD_FORMAT_F32");
+        }
+        if (destination.values.memory_type != FIELD_MEMORY_TYPE_CUDA_DEVICE) {
+            throw std::invalid_argument("snapshot density destination must use FIELD_MEMORY_TYPE_CUDA_DEVICE");
+        }
+        if (destination.values.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
+            throw std::invalid_argument("snapshot density destination size_bytes is smaller than nx*ny*nz*sizeof(float)");
         }
 
         check_cuda(
-            cudaMemcpyAsync(destination.data, fields.density.data, compact_bytes_, cudaMemcpyDeviceToDevice, stream),
+            cudaMemcpyAsync(destination.values.data, fields.density.values.data, compact_bytes_, cudaMemcpyDeviceToDevice, stream),
             "cudaMemcpyAsync density snapshot");
     }
 
-    void Solver3D::snapshot_velocity_magnitude(const FieldSet& fields, const BufferView& destination, Stream stream) {
+    void Solver3D::snapshot_velocity_magnitude(const FieldSet& fields, const ScalarFieldT& destination, Stream stream) {
         nvtx3::scoped_range range{"stable.snapshot_velocity_magnitude"};
         validate_fields_(fields);
-        if (destination.data == nullptr) {
-            throw std::invalid_argument("snapshot destination must provide a non-null device pointer");
+        if (destination.grid.nx != desc_.nx || destination.grid.ny != desc_.ny || destination.grid.nz != desc_.nz) {
+            throw std::invalid_argument("snapshot velocity magnitude destination grid dimensions must match the context");
         }
-        if (destination.format != STABLE_FLUIDS_BUFFER_FORMAT_F32) {
-            throw std::invalid_argument("snapshot destination must use STABLE_FLUIDS_BUFFER_FORMAT_F32");
+        if (std::fabs(destination.grid.cell_size - desc_.cell_size) > 1.0e-6f) {
+            throw std::invalid_argument("snapshot velocity magnitude destination cell_size must match the context");
         }
-        if (destination.memory_type != STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE) {
-            throw std::invalid_argument("snapshot destination must use STABLE_FLUIDS_MEMORY_TYPE_CUDA_DEVICE");
+        if (destination.values.data == nullptr) {
+            throw std::invalid_argument("snapshot velocity magnitude destination must provide a non-null device pointer");
         }
-        if (destination.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
-            throw std::invalid_argument("snapshot destination size_bytes is smaller than nx*ny*nz*sizeof(float)");
+        if (destination.values.format != FIELD_FORMAT_F32) {
+            throw std::invalid_argument("snapshot velocity magnitude destination must use FIELD_FORMAT_F32");
+        }
+        if (destination.values.memory_type != FIELD_MEMORY_TYPE_CUDA_DEVICE) {
+            throw std::invalid_argument("snapshot velocity magnitude destination must use FIELD_MEMORY_TYPE_CUDA_DEVICE");
+        }
+        if (destination.values.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
+            throw std::invalid_argument("snapshot velocity magnitude destination size_bytes is smaller than nx*ny*nz*sizeof(float)");
         }
 
         constexpr int block_size = 256;
         const int grid_size = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
         velocity_magnitude_kernel<<<grid_size, block_size, 0, stream>>>(
-            reinterpret_cast<float*>(destination.data),
-            reinterpret_cast<const float*>(fields.velocity_x.data),
-            reinterpret_cast<const float*>(fields.velocity_y.data),
-            reinterpret_cast<const float*>(fields.velocity_z.data),
+            reinterpret_cast<float*>(destination.values.data),
+            reinterpret_cast<const float*>(fields.velocity.x.data),
+            reinterpret_cast<const float*>(fields.velocity.y.data),
+            reinterpret_cast<const float*>(fields.velocity.z.data),
             interior_cell_count_);
         check_cuda(cudaGetLastError(), "velocity_magnitude_kernel launch");
     }
@@ -785,7 +819,7 @@ namespace {
 extern "C" {
 
 StableFluidsContextDesc stable_fluids_context_desc_default(void) {
-    return StableFluidsContextDesc{96, 96, 96, 1.0f / 60.0f, 1.0f, 0.0001f, 0.00005f, 20, 80, 1.0e-5f, 8, 8, 8};
+    return StableFluidsContextDesc{96, 96, 96, 1.0f / 60.0f, 1.0f, 0.0001f, 0.00005f, 20, 80, 8, 8, 8};
 }
 
 StableFluidsContext* stable_fluids_context_create(const StableFluidsContextDesc* desc) {
@@ -823,46 +857,50 @@ uint64_t stable_fluids_context_required_scalar_field_bytes(const StableFluidsCon
     return context != nullptr && context->solver != nullptr ? context->solver->required_scalar_field_bytes() : 0;
 }
 
-int32_t stable_fluids_fields_clear_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream) {
+uint64_t stable_fluids_context_required_vector_field_component_bytes(const StableFluidsContext* context, uint32_t component) {
+    return context != nullptr && context->solver != nullptr ? context->solver->required_vector_field_component_bytes(component) : 0;
+}
+
+int32_t stable_fluids_fields_clear_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_clear_async received a null argument");
     }
     return stable_fluids_try(context, [&] { context->solver->zero_fields(*fields, to_stream(cuda_stream)); });
 }
 
-int32_t stable_fluids_fields_step_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, void* cuda_stream) {
+int32_t stable_fluids_fields_step_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_step_async received a null argument");
     }
     return stable_fluids_try(context, [&] { context->solver->step(*fields, to_stream(cuda_stream)); });
 }
 
-int32_t stable_fluids_fields_add_density_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsDensitySplatDesc* splat, void* cuda_stream) {
+int32_t stable_fluids_fields_add_density_splat_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const StableFluidsDensitySplatDesc* splat, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_density_splat_async received a null argument");
     }
     return stable_fluids_try(context, [&] { context->solver->add_density_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->amount, to_stream(cuda_stream)); });
 }
 
-int32_t stable_fluids_fields_add_force_splat_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, const StableFluidsForceSplatDesc* splat, void* cuda_stream) {
+int32_t stable_fluids_fields_add_force_splat_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const StableFluidsForceSplatDesc* splat, void* cuda_stream) {
     if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_force_splat_async received a null argument");
     }
     return stable_fluids_try(context, [&] { context->solver->add_force_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->force_x, splat->force_y, splat->force_z, to_stream(cuda_stream)); });
 }
 
-int32_t stable_fluids_fields_snapshot_density_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, StableFluidsBufferView destination, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
+int32_t stable_fluids_fields_snapshot_density_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const ScalarField* destination, void* cuda_stream) {
+    if (context == nullptr || context->solver == nullptr || fields == nullptr || destination == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_snapshot_density_async received a null argument");
     }
-    return stable_fluids_try(context, [&] { context->solver->snapshot_density(*fields, destination, to_stream(cuda_stream)); });
+    return stable_fluids_try(context, [&] { context->solver->snapshot_density(*fields, *destination, to_stream(cuda_stream)); });
 }
 
-int32_t stable_fluids_fields_snapshot_velocity_magnitude_async(StableFluidsContext* context, const StableFluidsFieldSetDesc* fields, StableFluidsBufferView destination, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
+int32_t stable_fluids_fields_snapshot_velocity_magnitude_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const ScalarField* destination, void* cuda_stream) {
+    if (context == nullptr || context->solver == nullptr || fields == nullptr || destination == nullptr) {
         return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_snapshot_velocity_magnitude_async received a null argument");
     }
-    return stable_fluids_try(context, [&] { context->solver->snapshot_velocity_magnitude(*fields, destination, to_stream(cuda_stream)); });
+    return stable_fluids_try(context, [&] { context->solver->snapshot_velocity_magnitude(*fields, *destination, to_stream(cuda_stream)); });
 }
 
 uint64_t stable_fluids_last_error_length(void) {
