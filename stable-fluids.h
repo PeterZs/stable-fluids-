@@ -23,6 +23,7 @@ extern "C" {
 Error code scheme:
 0     : success
 1xxx  : scalar/grid/step parameter errors
+1000  : invalid step descriptor
 1001  : invalid grid dimensions
 1002  : invalid cell size
 1003  : invalid dt
@@ -42,12 +43,47 @@ Error code scheme:
 2014  : invalid temporary previous velocity_z buffer
 2015  : invalid temporary pressure buffer
 2016  : invalid temporary divergence buffer
+3xxx  : backend binding errors
+3002  : CPU backend requires stream == nullptr
+3003  : CUDA backend requires stream != nullptr
 5xxx  : CUDA runtime or kernel launch failure
 5001  : CUDA call failed
 */
 
-STABLE_FLUIDS_API int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float cell_size, void* temporary_density, void* temporary_velocity_x, void* temporary_velocity_y, void* temporary_velocity_z, void* temporary_previous_density, void* temporary_previous_velocity_x,
-    void* temporary_previous_velocity_y, void* temporary_previous_velocity_z, void* temporary_pressure, void* temporary_divergence, float dt, float viscosity, float diffusion, int32_t diffuse_iterations, int32_t pressure_iterations, int32_t block_x, int32_t block_y, int32_t block_z, void* cuda_stream);
+typedef struct StableFluidsStepDesc {
+    uint32_t struct_size;
+    uint32_t api_version;
+    int32_t nx;
+    int32_t ny;
+    int32_t nz;
+    float cell_size;
+    float dt;
+    float viscosity;
+    float diffusion;
+    int32_t diffuse_iterations;
+    int32_t pressure_iterations;
+    void* density;
+    void* velocity_x;
+    void* velocity_y;
+    void* velocity_z;
+    void* temporary_density;
+    void* temporary_velocity_x;
+    void* temporary_velocity_y;
+    void* temporary_velocity_z;
+    void* temporary_previous_density;
+    void* temporary_previous_velocity_x;
+    void* temporary_previous_velocity_y;
+    void* temporary_previous_velocity_z;
+    void* temporary_pressure;
+    void* temporary_divergence;
+    int32_t block_x;
+    int32_t block_y;
+    int32_t block_z;
+    void* stream;
+} StableFluidsStepDesc;
+
+STABLE_FLUIDS_API int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc);
+STABLE_FLUIDS_API int32_t stable_fluids_step_cpu(const StableFluidsStepDesc* desc);
 
 #ifdef __cplusplus
 }

@@ -258,9 +258,23 @@ namespace {
 
 extern "C" {
 
-int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity_y, void* velocity_z, int32_t nx, int32_t ny, int32_t nz, float cell_size, void* temporary_density, void* temporary_velocity_x, void* temporary_velocity_y, void* temporary_velocity_z, void* temporary_previous_density, void* temporary_previous_velocity_x,
-    void* temporary_previous_velocity_y, void* temporary_previous_velocity_z, void* temporary_pressure, void* temporary_divergence, float dt, float viscosity, float diffusion, int32_t diffuse_iterations, int32_t pressure_iterations, int32_t block_x, int32_t block_y, int32_t block_z, void* cuda_stream) {
+int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc) {
     using namespace stable_fluids;
+    if (desc == nullptr) return 1000;
+    if (desc->struct_size < sizeof(StableFluidsStepDesc)) return 1000;
+    if (desc->stream == nullptr) return 3003;
+    const int32_t nx = desc->nx;
+    const int32_t ny = desc->ny;
+    const int32_t nz = desc->nz;
+    const float cell_size = desc->cell_size;
+    const float dt = desc->dt;
+    const float viscosity = desc->viscosity;
+    const float diffusion = desc->diffusion;
+    const int32_t diffuse_iterations = desc->diffuse_iterations;
+    const int32_t pressure_iterations = desc->pressure_iterations;
+    const int32_t block_x = desc->block_x;
+    const int32_t block_y = desc->block_y;
+    const int32_t block_z = desc->block_z;
     if (nx <= 0 || ny <= 0 || nz <= 0) return 1001;
     if (cell_size <= 0.0f) return 1002;
     if (dt <= 0.0f) return 1003;
@@ -270,41 +284,41 @@ int32_t stable_fluids_step_async(void* density, void* velocity_x, void* velocity
     const auto velocity_x_field_bytes = velocity_x_bytes(nx, ny, nz);
     const auto velocity_y_field_bytes = velocity_y_bytes(nx, ny, nz);
     const auto velocity_z_field_bytes = velocity_z_bytes(nx, ny, nz);
-    if (density == nullptr) return 2001;
-    if (velocity_x == nullptr) return 2003;
-    if (velocity_y == nullptr) return 2004;
-    if (velocity_z == nullptr) return 2005;
-    if (temporary_density == nullptr) return 2007;
-    if (temporary_velocity_x == nullptr) return 2008;
-    if (temporary_velocity_y == nullptr) return 2009;
-    if (temporary_velocity_z == nullptr) return 2010;
-    if (temporary_previous_density == nullptr) return 2011;
-    if (temporary_previous_velocity_x == nullptr) return 2012;
-    if (temporary_previous_velocity_y == nullptr) return 2013;
-    if (temporary_previous_velocity_z == nullptr) return 2014;
-    if (temporary_pressure == nullptr) return 2015;
-    if (temporary_divergence == nullptr) return 2016;
+    if (desc->density == nullptr) return 2001;
+    if (desc->velocity_x == nullptr) return 2003;
+    if (desc->velocity_y == nullptr) return 2004;
+    if (desc->velocity_z == nullptr) return 2005;
+    if (desc->temporary_density == nullptr) return 2007;
+    if (desc->temporary_velocity_x == nullptr) return 2008;
+    if (desc->temporary_velocity_y == nullptr) return 2009;
+    if (desc->temporary_velocity_z == nullptr) return 2010;
+    if (desc->temporary_previous_density == nullptr) return 2011;
+    if (desc->temporary_previous_velocity_x == nullptr) return 2012;
+    if (desc->temporary_previous_velocity_y == nullptr) return 2013;
+    if (desc->temporary_previous_velocity_z == nullptr) return 2014;
+    if (desc->temporary_pressure == nullptr) return 2015;
+    if (desc->temporary_divergence == nullptr) return 2016;
 
-    auto* density_field = reinterpret_cast<float*>(density);
-    auto* density_temporary = reinterpret_cast<float*>(temporary_density);
-    auto* density_previous = reinterpret_cast<float*>(temporary_previous_density);
-    auto* velocity_x_field = reinterpret_cast<float*>(velocity_x);
-    auto* velocity_y_field = reinterpret_cast<float*>(velocity_y);
-    auto* velocity_z_field = reinterpret_cast<float*>(velocity_z);
-    auto* velocity_x_temporary = reinterpret_cast<float*>(temporary_velocity_x);
-    auto* velocity_y_temporary = reinterpret_cast<float*>(temporary_velocity_y);
-    auto* velocity_z_temporary = reinterpret_cast<float*>(temporary_velocity_z);
-    auto* velocity_x_previous = reinterpret_cast<float*>(temporary_previous_velocity_x);
-    auto* velocity_y_previous = reinterpret_cast<float*>(temporary_previous_velocity_y);
-    auto* velocity_z_previous = reinterpret_cast<float*>(temporary_previous_velocity_z);
-    auto* pressure = reinterpret_cast<float*>(temporary_pressure);
-    auto* divergence = reinterpret_cast<float*>(temporary_divergence);
+    auto* density_field = reinterpret_cast<float*>(desc->density);
+    auto* density_temporary = reinterpret_cast<float*>(desc->temporary_density);
+    auto* density_previous = reinterpret_cast<float*>(desc->temporary_previous_density);
+    auto* velocity_x_field = reinterpret_cast<float*>(desc->velocity_x);
+    auto* velocity_y_field = reinterpret_cast<float*>(desc->velocity_y);
+    auto* velocity_z_field = reinterpret_cast<float*>(desc->velocity_z);
+    auto* velocity_x_temporary = reinterpret_cast<float*>(desc->temporary_velocity_x);
+    auto* velocity_y_temporary = reinterpret_cast<float*>(desc->temporary_velocity_y);
+    auto* velocity_z_temporary = reinterpret_cast<float*>(desc->temporary_velocity_z);
+    auto* velocity_x_previous = reinterpret_cast<float*>(desc->temporary_previous_velocity_x);
+    auto* velocity_y_previous = reinterpret_cast<float*>(desc->temporary_previous_velocity_y);
+    auto* velocity_z_previous = reinterpret_cast<float*>(desc->temporary_previous_velocity_z);
+    auto* pressure = reinterpret_cast<float*>(desc->temporary_pressure);
+    auto* divergence = reinterpret_cast<float*>(desc->temporary_divergence);
     const dim3 block{static_cast<unsigned>(std::max(block_x, 1)), static_cast<unsigned>(std::max(block_y, 1)), static_cast<unsigned>(std::max(block_z, 1))};
     const dim3 cells = make_grid(nx, ny, nz, block);
     const dim3 u_grid = make_grid(nx + 1, ny, nz, block);
     const dim3 v_grid = make_grid(nx, ny + 1, nz, block);
     const dim3 w_grid = make_grid(nx, ny, nz + 1, block);
-    const auto stream = to_stream(cuda_stream);
+    const auto stream = to_stream(desc->stream);
 
     nvtx3::scoped_range step_range{"stable.step"};
     {

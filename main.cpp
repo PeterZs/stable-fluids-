@@ -128,9 +128,37 @@ int main() {
             }
         }
 
-        if (!stable_ok(stable_fluids_step_async(density, velocity_x, velocity_y, velocity_z, nx, ny, nz, cell_size, temporary_density, temporary_velocity_x, temporary_velocity_y, temporary_velocity_z, temporary_previous_density, temporary_previous_velocity_x, temporary_previous_velocity_y, temporary_previous_velocity_z, temporary_pressure,
-                           temporary_divergence, dt, viscosity, diffusion, diffuse_iterations, pressure_iterations, block_x, block_y, block_z, stream),
-                "stable_fluids_step_async")) {
+        StableFluidsStepDesc step_desc{};
+        step_desc.struct_size                  = sizeof(StableFluidsStepDesc);
+        step_desc.api_version                  = 1;
+        step_desc.nx                           = nx;
+        step_desc.ny                           = ny;
+        step_desc.nz                           = nz;
+        step_desc.cell_size                    = cell_size;
+        step_desc.dt                           = dt;
+        step_desc.viscosity                    = viscosity;
+        step_desc.diffusion                    = diffusion;
+        step_desc.diffuse_iterations           = diffuse_iterations;
+        step_desc.pressure_iterations          = pressure_iterations;
+        step_desc.density                      = density;
+        step_desc.velocity_x                   = velocity_x;
+        step_desc.velocity_y                   = velocity_y;
+        step_desc.velocity_z                   = velocity_z;
+        step_desc.temporary_density            = temporary_density;
+        step_desc.temporary_velocity_x         = temporary_velocity_x;
+        step_desc.temporary_velocity_y         = temporary_velocity_y;
+        step_desc.temporary_velocity_z         = temporary_velocity_z;
+        step_desc.temporary_previous_density   = temporary_previous_density;
+        step_desc.temporary_previous_velocity_x = temporary_previous_velocity_x;
+        step_desc.temporary_previous_velocity_y = temporary_previous_velocity_y;
+        step_desc.temporary_previous_velocity_z = temporary_previous_velocity_z;
+        step_desc.temporary_pressure           = temporary_pressure;
+        step_desc.temporary_divergence         = temporary_divergence;
+        step_desc.block_x                      = block_x;
+        step_desc.block_y                      = block_y;
+        step_desc.block_z                      = block_z;
+        step_desc.stream                       = stream;
+        if (!stable_ok(stable_fluids_step_cuda(&step_desc), "stable_fluids_step_cuda")) {
             cudaStreamDestroy(stream);
             cudaFree(density);
             cudaFree(velocity_x);

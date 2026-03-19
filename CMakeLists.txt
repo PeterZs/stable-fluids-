@@ -27,7 +27,8 @@ add_library(
         stable-fluids
         SHARED
         stable-fluids.h
-        solver.cu
+        backend-cuda.cu
+        backend-cpu.cpp
 )
 
 add_executable(
