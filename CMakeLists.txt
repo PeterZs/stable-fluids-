@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.1.2)
 
-project(stable-fluids VERSION 0.3.0 LANGUAGES CXX CUDA)
+project(stable-fluids VERSION 1.0.0 LANGUAGES CXX CUDA)
 
 # ============================================================================
 # Toolchain
