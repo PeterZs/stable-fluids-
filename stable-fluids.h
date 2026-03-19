@@ -15,11 +15,29 @@
 #define STABLE_FLUIDS_API
 #endif
 
-#define STABLE_FLUIDS_SUCCESS 0
-
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*
+Error code scheme:
+0     : success
+1xxx  : scalar/grid/step parameter errors
+1001  : invalid grid dimensions
+1002  : invalid cell size
+1003  : invalid dt
+1004  : invalid iteration count
+1005  : invalid source radius
+2xxx  : buffer/workspace errors
+2001  : invalid density buffer
+2003  : invalid velocity_x buffer
+2004  : invalid velocity_y buffer
+2005  : invalid velocity_z buffer
+2006  : invalid destination buffer
+2007  : invalid workspace buffer
+5xxx  : CUDA runtime or kernel launch failure
+5001  : CUDA call failed
+*/
 
 STABLE_FLUIDS_API uint64_t stable_fluids_scalar_field_bytes(int32_t nx, int32_t ny, int32_t nz);
 STABLE_FLUIDS_API uint64_t stable_fluids_workspace_bytes(int32_t nx, int32_t ny, int32_t nz);

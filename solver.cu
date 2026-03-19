@@ -4,20 +4,14 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
-#include <stdexcept>
-#include <string>
-#include <utility>
 
 namespace stable_fluids {
     using Stream = cudaStream_t;
 
     namespace {
 
-        inline void check_cuda(cudaError_t status, const char* what) {
-            if (status == cudaSuccess) {
-                return;
-            }
-            throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
+        [[nodiscard]] inline int32_t cuda_code(cudaError_t status) noexcept {
+            return status == cudaSuccess ? 0 : 5001;
         }
 
         inline std::uint64_t ghosted_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
@@ -347,23 +341,23 @@ int32_t stable_fluids_clear_async(
     void* cuda_stream) {
     using namespace stable_fluids;
     if (nx <= 0 || ny <= 0 || nz <= 0) {
-        throw std::invalid_argument("grid dimensions must be positive");
+        return 1001;
     }
     if (cell_size <= 0.0f) {
-        throw std::invalid_argument("cell_size must be positive");
+        return 1002;
     }
     const auto compact_bytes = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
     if (density == nullptr || density_bytes < compact_bytes) {
-        throw std::invalid_argument("density is invalid");
+        return 2001;
     }
     if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_x is invalid");
+        return 2003;
     }
     if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_y is invalid");
+        return 2004;
     }
     if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_z is invalid");
+        return 2005;
     }
 
     nvtx3::scoped_range range{"stable.clear"};
@@ -377,8 +371,10 @@ int32_t stable_fluids_clear_async(
     zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(u, compact_bytes / sizeof(float));
     zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(v, compact_bytes / sizeof(float));
     zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(w, compact_bytes / sizeof(float));
-    check_cuda(cudaGetLastError(), "zero_compact_field_kernel launch");
-    return STABLE_FLUIDS_SUCCESS;
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
+    return 0;
 }
 
 int32_t stable_fluids_add_density_splat_async(
@@ -396,17 +392,17 @@ int32_t stable_fluids_add_density_splat_async(
     void* cuda_stream) {
     using namespace stable_fluids;
     if (nx <= 0 || ny <= 0 || nz <= 0) {
-        throw std::invalid_argument("grid dimensions must be positive");
+        return 1001;
     }
     if (cell_size <= 0.0f) {
-        throw std::invalid_argument("cell_size must be positive");
+        return 1002;
     }
     if (density == nullptr) {
-        throw std::invalid_argument("density must provide a non-null device pointer");
+        return 2001;
     }
     const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
     if (density_bytes < compact_count * sizeof(float)) {
-        throw std::invalid_argument("density size_bytes is too small");
+        return 2001;
     }
 
     nvtx3::scoped_range range{"stable.add_density_splat"};
@@ -422,8 +418,10 @@ int32_t stable_fluids_add_density_splat_async(
         nx,
         ny,
         nz);
-    check_cuda(cudaGetLastError(), "splat_density_compact_kernel launch");
-    return STABLE_FLUIDS_SUCCESS;
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
+    return 0;
 }
 
 int32_t stable_fluids_add_force_splat_async(
@@ -447,21 +445,21 @@ int32_t stable_fluids_add_force_splat_async(
     void* cuda_stream) {
     using namespace stable_fluids;
     if (nx <= 0 || ny <= 0 || nz <= 0) {
-        throw std::invalid_argument("grid dimensions must be positive");
+        return 1001;
     }
     if (cell_size <= 0.0f) {
-        throw std::invalid_argument("cell_size must be positive");
+        return 1002;
     }
     const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
     const auto compact_bytes = compact_count * sizeof(float);
     if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_x is invalid");
+        return 2003;
     }
     if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_y is invalid");
+        return 2004;
     }
     if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_z is invalid");
+        return 2005;
     }
 
     nvtx3::scoped_range range{"stable.add_force_splat"};
@@ -481,8 +479,10 @@ int32_t stable_fluids_add_force_splat_async(
         nx,
         ny,
         nz);
-    check_cuda(cudaGetLastError(), "splat_force_compact_kernel launch");
-    return STABLE_FLUIDS_SUCCESS;
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
+    return 0;
 }
 
 int32_t stable_fluids_step_async(
@@ -511,16 +511,16 @@ int32_t stable_fluids_step_async(
     void* cuda_stream) {
     using namespace stable_fluids;
     if (nx <= 0 || ny <= 0 || nz <= 0) {
-        throw std::invalid_argument("grid dimensions must be positive");
+        return 1001;
     }
     if (cell_size <= 0.0f) {
-        throw std::invalid_argument("cell_size must be positive");
+        return 1002;
     }
     if (dt <= 0.0f) {
-        throw std::invalid_argument("dt must be positive");
+        return 1003;
     }
     if (diffuse_iterations <= 0 || pressure_iterations <= 0) {
-        throw std::invalid_argument("iteration counts must be positive");
+        return 1004;
     }
 
     const auto interior_cell_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
@@ -532,22 +532,19 @@ int32_t stable_fluids_step_async(
     const auto ghosted_field_bytes = total_cell_count * sizeof(float);
 
     if (density == nullptr || density_bytes < compact_bytes) {
-        throw std::invalid_argument("density is invalid");
+        return 2001;
     }
     if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_x is invalid");
+        return 2003;
     }
     if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_y is invalid");
+        return 2004;
     }
     if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_z is invalid");
+        return 2005;
     }
-    if (workspace == nullptr) {
-        throw std::invalid_argument("workspace must provide a non-null device pointer");
-    }
-    if (workspace_bytes < ghosted_field_bytes * 10ull) {
-        throw std::invalid_argument("workspace size_bytes is too small");
+    if (workspace == nullptr || workspace_bytes < ghosted_field_bytes * 10ull) {
+        return 2007;
     }
 
     auto* cursor = reinterpret_cast<std::byte*>(workspace);
@@ -591,63 +588,73 @@ int32_t stable_fluids_step_async(
     fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(u_g, 0.0f, total_cell_count);
     fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(v_g, 0.0f, total_cell_count);
     fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(w_g, 0.0f, total_cell_count);
-    check_cuda(cudaGetLastError(), "fill_kernel launch");
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
     copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(density_g, density_compact, nx, ny, nx_total, ny_total, interior_cell_count);
     copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(u_g, u_compact, nx, ny, nx_total, ny_total, interior_cell_count);
     copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(v_g, v_compact, nx, ny, nx_total, ny_total, interior_cell_count);
     copy_compact_to_ghosted_kernel<<<compact_grid, linear_block_size, 0, stream>>>(w_g, w_compact, nx, ny, nx_total, ny_total, interior_cell_count);
-    check_cuda(cudaGetLastError(), "copy_compact_to_ghosted_kernel launch");
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
     set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
     set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
     set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
     set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-    check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
     {
         nvtx3::scoped_range range{"stable.step.advect_velocity"};
         advect_velocity_kernel<<<interior_grid, block, 0, stream>>>(u_prev, v_prev, w_prev, u_g, v_g, w_g, u_g, v_g, w_g, dt_over_h, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "advect_velocity_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) {
+            return 5001;
+        }
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_prev, nx, ny, nz, nx_total, ny_total);
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_prev, nx, ny, nz, nx_total, ny_total);
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_prev, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) {
+            return 5001;
+        }
     }
     {
         nvtx3::scoped_range range{"stable.step.diffuse_velocity"};
         if (viscosity <= 0.0f) {
-            check_cuda(cudaMemcpyAsync(u_g, u_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse bypass");
-            check_cuda(cudaMemcpyAsync(v_g, v_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse bypass");
-            check_cuda(cudaMemcpyAsync(w_g, w_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse bypass");
+            if (cuda_code(cudaMemcpyAsync(u_g, u_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(v_g, v_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(w_g, w_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
         } else {
-            check_cuda(cudaMemcpyAsync(u_g, u_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse init");
-            check_cuda(cudaMemcpyAsync(v_g, v_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse init");
-            check_cuda(cudaMemcpyAsync(w_g, w_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse init");
+            if (cuda_code(cudaMemcpyAsync(u_g, u_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(v_g, v_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
+            if (cuda_code(cudaMemcpyAsync(w_g, w_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
             const float alpha = dt * viscosity / (cell_size * cell_size);
             const float denom = 1.0f + 6.0f * alpha;
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
             for (int iteration = 0; iteration < diffuse_iterations; ++iteration) {
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(u_g, u_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(v_g, v_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(w_g, w_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity red launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(u_g, u_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(v_g, v_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(w_g, w_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity black launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
             }
         }
     }
@@ -656,58 +663,58 @@ int32_t stable_fluids_step_async(
         const float half_inv_h = 0.5f / cell_size;
         const float h2 = cell_size * cell_size;
         divergence_kernel<<<interior_grid, block, 0, stream>>>(divergence, u_g, v_g, w_g, half_inv_h, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "divergence_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, divergence, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
         fill_kernel<<<fill_grid, linear_block_size, 0, stream>>>(pressure, 0.0f, total_cell_count);
-        check_cuda(cudaGetLastError(), "fill_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, pressure, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
         for (int iteration = 0; iteration < pressure_iterations; ++iteration) {
             rbgs_pressure_kernel<<<interior_grid, block, 0, stream>>>(pressure, divergence, h2, 0, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "rbgs_pressure_kernel red launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, pressure, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
             rbgs_pressure_kernel<<<interior_grid, block, 0, stream>>>(pressure, divergence, h2, 1, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "rbgs_pressure_kernel black launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, pressure, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
         }
         subtract_gradient_kernel<<<interior_grid, block, 0, stream>>>(u_g, v_g, w_g, pressure, half_inv_h, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "subtract_gradient_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(1, u_g, nx, ny, nz, nx_total, ny_total);
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(2, v_g, nx, ny, nz, nx_total, ny_total);
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(3, w_g, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
     }
     {
         nvtx3::scoped_range range{"stable.step.advect_density"};
         advect_scalar_kernel<<<interior_grid, block, 0, stream>>>(density_prev, density_g, u_g, v_g, w_g, dt_over_h, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "advect_scalar_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
         set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_prev, nx, ny, nz, nx_total, ny_total);
-        check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+        if (cuda_code(cudaGetLastError()) != 0) return 5001;
     }
     {
         nvtx3::scoped_range range{"stable.step.diffuse_density"};
         if (diffusion <= 0.0f) {
-            check_cuda(cudaMemcpyAsync(density_g, density_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse bypass");
+            if (cuda_code(cudaMemcpyAsync(density_g, density_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
         } else {
-            check_cuda(cudaMemcpyAsync(density_g, density_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse init");
+            if (cuda_code(cudaMemcpyAsync(density_g, density_prev, ghosted_field_bytes, cudaMemcpyDeviceToDevice, stream)) != 0) return 5001;
             const float alpha = dt * diffusion / (cell_size * cell_size);
             const float denom = 1.0f + 6.0f * alpha;
             set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-            check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+            if (cuda_code(cudaGetLastError()) != 0) return 5001;
             for (int iteration = 0; iteration < diffuse_iterations; ++iteration) {
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(density_g, density_prev, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar red launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
                 rbgs_diffuse_kernel<<<interior_grid, block, 0, stream>>>(density_g, density_prev, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar black launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
                 set_boundary_kernel<<<ghost_grid, block, 0, stream>>>(0, density_g, nx, ny, nz, nx_total, ny_total);
-                check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+                if (cuda_code(cudaGetLastError()) != 0) return 5001;
             }
         }
     }
@@ -715,8 +722,10 @@ int32_t stable_fluids_step_async(
     copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(u_compact, u_g, nx, ny, nx_total, ny_total, interior_cell_count);
     copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(v_compact, v_g, nx, ny, nx_total, ny_total, interior_cell_count);
     copy_ghosted_to_compact_kernel<<<compact_grid, linear_block_size, 0, stream>>>(w_compact, w_g, nx, ny, nx_total, ny_total, interior_cell_count);
-    check_cuda(cudaGetLastError(), "copy_ghosted_to_compact_kernel launch");
-    return STABLE_FLUIDS_SUCCESS;
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
+    return 0;
 }
 
 int32_t stable_fluids_compute_velocity_magnitude_async(
@@ -735,24 +744,24 @@ int32_t stable_fluids_compute_velocity_magnitude_async(
     void* cuda_stream) {
     using namespace stable_fluids;
     if (nx <= 0 || ny <= 0 || nz <= 0) {
-        throw std::invalid_argument("grid dimensions must be positive");
+        return 1001;
     }
     if (cell_size <= 0.0f) {
-        throw std::invalid_argument("cell_size must be positive");
+        return 1002;
     }
     const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
     const auto compact_bytes = compact_count * sizeof(float);
     if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_x is invalid");
+        return 2003;
     }
     if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_y is invalid");
+        return 2004;
     }
     if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
-        throw std::invalid_argument("velocity_z is invalid");
+        return 2005;
     }
     if (destination == nullptr || destination_bytes < compact_bytes) {
-        throw std::invalid_argument("destination is invalid");
+        return 2006;
     }
 
     nvtx3::scoped_range range{"stable.snapshot_velocity_magnitude"};
@@ -764,8 +773,10 @@ int32_t stable_fluids_compute_velocity_magnitude_async(
         reinterpret_cast<const float*>(velocity_y),
         reinterpret_cast<const float*>(velocity_z),
         compact_count);
-    check_cuda(cudaGetLastError(), "velocity_magnitude_kernel launch");
-    return STABLE_FLUIDS_SUCCESS;
+    if (cuda_code(cudaGetLastError()) != 0) {
+        return 5001;
+    }
+    return 0;
 }
 
 } // extern "C"

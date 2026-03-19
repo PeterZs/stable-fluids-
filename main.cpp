@@ -20,7 +20,7 @@ bool cuda_ok(const cudaError_t status, const char* what) {
 }
 
 bool stable_ok(const int32_t code, const char* what) {
-    if (code == STABLE_FLUIDS_SUCCESS) {
+    if (code == 0) {
         return true;
     }
     std::cerr << what << " failed (" << code << ")\n";
