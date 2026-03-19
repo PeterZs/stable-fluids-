@@ -9,29 +9,23 @@
 #include <numeric>
 #include <vector>
 
-namespace {
-
-bool cuda_ok(const cudaError_t status, const char* what) {
-    if (status == cudaSuccess) {
-        return true;
-    }
-    std::cerr << what << " failed: " << cudaGetErrorString(status) << '\n';
-    return false;
-}
-
-bool stable_ok(const int32_t code, const char* what) {
-    if (code == 0) {
-        return true;
-    }
-    std::cerr << what << " failed (" << code << ")\n";
-    return false;
-}
-
-} // namespace
-
 int main() {
     try {
         nvtx3::scoped_range app_range{"stable.demo"};
+        auto cuda_ok = [](const cudaError_t status, const char* what) {
+            if (status == cudaSuccess) {
+                return true;
+            }
+            std::cerr << what << " failed: " << cudaGetErrorString(status) << '\n';
+            return false;
+        };
+        auto stable_ok = [](const int32_t code, const char* what) {
+            if (code == 0) {
+                return true;
+            }
+            std::cerr << what << " failed (" << code << ")\n";
+            return false;
+        };
 
     constexpr int32_t nx = 96;
     constexpr int32_t ny = 96;

@@ -14,12 +14,8 @@ namespace stable_fluids {
             return status == cudaSuccess ? 0 : 5001;
         }
 
-        inline std::uint64_t ghosted_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
-            return static_cast<std::uint64_t>(nx + 2) * static_cast<std::uint64_t>(ny + 2) * static_cast<std::uint64_t>(nz + 2) * sizeof(float);
-        }
-
         inline std::uint64_t workspace_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
-            return ghosted_bytes(nx, ny, nz) * 10ull;
+            return static_cast<std::uint64_t>(nx + 2) * static_cast<std::uint64_t>(ny + 2) * static_cast<std::uint64_t>(nz + 2) * sizeof(float) * 10ull;
         }
 
         inline dim3 make_grid(int nx, int ny, int nz, const dim3& block) {
