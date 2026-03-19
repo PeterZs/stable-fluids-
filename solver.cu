@@ -14,10 +14,6 @@ namespace stable_fluids {
             return status == cudaSuccess ? 0 : 5001;
         }
 
-        inline std::uint64_t workspace_bytes(const int32_t nx, const int32_t ny, const int32_t nz) {
-            return static_cast<std::uint64_t>(nx + 2) * static_cast<std::uint64_t>(ny + 2) * static_cast<std::uint64_t>(nz + 2) * sizeof(float) * 10ull;
-        }
-
         inline dim3 make_grid(int nx, int ny, int nz, const dim3& block) {
             return dim3(static_cast<unsigned>((nx + static_cast<int>(block.x) - 1) / static_cast<int>(block.x)), static_cast<unsigned>((ny + static_cast<int>(block.y) - 1) / static_cast<int>(block.y)), static_cast<unsigned>((nz + static_cast<int>(block.z) - 1) / static_cast<int>(block.z)));
         }
@@ -314,45 +310,37 @@ uint64_t stable_fluids_scalar_field_bytes(int32_t nx, int32_t ny, int32_t nz) {
     return static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
 }
 
-uint64_t stable_fluids_workspace_bytes(int32_t nx, int32_t ny, int32_t nz) {
+uint64_t stable_fluids_temporary_field_bytes(int32_t nx, int32_t ny, int32_t nz) {
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         return 0;
     }
-    return stable_fluids::workspace_bytes(nx, ny, nz);
+    return static_cast<uint64_t>(nx + 2) * static_cast<uint64_t>(ny + 2) * static_cast<uint64_t>(nz + 2) * sizeof(float);
 }
 
 int32_t stable_fluids_clear_async(
     void* density,
-    uint64_t density_bytes,
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     void* cuda_stream) {
     using namespace stable_fluids;
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         return 1001;
     }
-    if (cell_size <= 0.0f) {
-        return 1002;
-    }
     const auto compact_bytes = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
-    if (density == nullptr || density_bytes < compact_bytes) {
+    if (density == nullptr) {
         return 2001;
     }
-    if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
+    if (velocity_x == nullptr) {
         return 2003;
     }
-    if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
+    if (velocity_y == nullptr) {
         return 2004;
     }
-    if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
+    if (velocity_z == nullptr) {
         return 2005;
     }
 
@@ -375,11 +363,9 @@ int32_t stable_fluids_clear_async(
 
 int32_t stable_fluids_add_density_splat_async(
     void* density,
-    uint64_t density_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     float center_x,
     float center_y,
     float center_z,
@@ -390,17 +376,9 @@ int32_t stable_fluids_add_density_splat_async(
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         return 1001;
     }
-    if (cell_size <= 0.0f) {
-        return 1002;
-    }
     if (density == nullptr) {
         return 2001;
     }
-    const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
-    if (density_bytes < compact_count * sizeof(float)) {
-        return 2001;
-    }
-
     nvtx3::scoped_range range{"stable.add_density_splat"};
     const dim3 block{8u, 8u, 8u};
     const dim3 grid = make_grid(nx, ny, nz, block);
@@ -422,15 +400,11 @@ int32_t stable_fluids_add_density_splat_async(
 
 int32_t stable_fluids_add_force_splat_async(
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     float center_x,
     float center_y,
     float center_z,
@@ -443,18 +417,13 @@ int32_t stable_fluids_add_force_splat_async(
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         return 1001;
     }
-    if (cell_size <= 0.0f) {
-        return 1002;
-    }
-    const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
-    const auto compact_bytes = compact_count * sizeof(float);
-    if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
+    if (velocity_x == nullptr) {
         return 2003;
     }
-    if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
+    if (velocity_y == nullptr) {
         return 2004;
     }
-    if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
+    if (velocity_z == nullptr) {
         return 2005;
     }
 
@@ -483,19 +452,23 @@ int32_t stable_fluids_add_force_splat_async(
 
 int32_t stable_fluids_step_async(
     void* density,
-    uint64_t density_bytes,
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
     float cell_size,
-    void* workspace,
-    uint64_t workspace_bytes,
+    void* temporary_density,
+    void* temporary_velocity_x,
+    void* temporary_velocity_y,
+    void* temporary_velocity_z,
+    void* temporary_previous_density,
+    void* temporary_previous_velocity_x,
+    void* temporary_previous_velocity_y,
+    void* temporary_previous_velocity_z,
+    void* temporary_pressure,
+    void* temporary_divergence,
     float dt,
     float viscosity,
     float diffusion,
@@ -520,49 +493,65 @@ int32_t stable_fluids_step_async(
     }
 
     const auto interior_cell_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
-    const auto compact_bytes = interior_cell_count * sizeof(float);
     const int nx_total = nx + 2;
     const int ny_total = ny + 2;
     const int nz_total = nz + 2;
     const auto total_cell_count = static_cast<std::size_t>(nx_total) * static_cast<std::size_t>(ny_total) * static_cast<std::size_t>(nz_total);
     const auto ghosted_field_bytes = total_cell_count * sizeof(float);
 
-    if (density == nullptr || density_bytes < compact_bytes) {
+    if (density == nullptr) {
         return 2001;
     }
-    if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
+    if (velocity_x == nullptr) {
         return 2003;
     }
-    if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
+    if (velocity_y == nullptr) {
         return 2004;
     }
-    if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
+    if (velocity_z == nullptr) {
         return 2005;
     }
-    if (workspace == nullptr || workspace_bytes < ghosted_field_bytes * 10ull) {
+    if (temporary_density == nullptr) {
         return 2007;
     }
+    if (temporary_velocity_x == nullptr) {
+        return 2008;
+    }
+    if (temporary_velocity_y == nullptr) {
+        return 2009;
+    }
+    if (temporary_velocity_z == nullptr) {
+        return 2010;
+    }
+    if (temporary_previous_density == nullptr) {
+        return 2011;
+    }
+    if (temporary_previous_velocity_x == nullptr) {
+        return 2012;
+    }
+    if (temporary_previous_velocity_y == nullptr) {
+        return 2013;
+    }
+    if (temporary_previous_velocity_z == nullptr) {
+        return 2014;
+    }
+    if (temporary_pressure == nullptr) {
+        return 2015;
+    }
+    if (temporary_divergence == nullptr) {
+        return 2016;
+    }
 
-    auto* cursor = reinterpret_cast<std::byte*>(workspace);
-    auto* density_g = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* u_g = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* v_g = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* w_g = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* density_prev = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* u_prev = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* v_prev = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* w_prev = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* pressure = reinterpret_cast<float*>(cursor);
-    cursor += ghosted_field_bytes;
-    auto* divergence = reinterpret_cast<float*>(cursor);
+    auto* density_g = reinterpret_cast<float*>(temporary_density);
+    auto* u_g = reinterpret_cast<float*>(temporary_velocity_x);
+    auto* v_g = reinterpret_cast<float*>(temporary_velocity_y);
+    auto* w_g = reinterpret_cast<float*>(temporary_velocity_z);
+    auto* density_prev = reinterpret_cast<float*>(temporary_previous_density);
+    auto* u_prev = reinterpret_cast<float*>(temporary_previous_velocity_x);
+    auto* v_prev = reinterpret_cast<float*>(temporary_previous_velocity_y);
+    auto* w_prev = reinterpret_cast<float*>(temporary_previous_velocity_z);
+    auto* pressure = reinterpret_cast<float*>(temporary_pressure);
+    auto* divergence = reinterpret_cast<float*>(temporary_divergence);
     auto* density_compact = reinterpret_cast<float*>(density);
     auto* u_compact = reinterpret_cast<float*>(velocity_x);
     auto* v_compact = reinterpret_cast<float*>(velocity_y);
@@ -726,37 +715,28 @@ int32_t stable_fluids_step_async(
 
 int32_t stable_fluids_compute_velocity_magnitude_async(
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     void* destination,
-    uint64_t destination_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     void* cuda_stream) {
     using namespace stable_fluids;
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         return 1001;
     }
-    if (cell_size <= 0.0f) {
-        return 1002;
-    }
     const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
-    const auto compact_bytes = compact_count * sizeof(float);
-    if (velocity_x == nullptr || velocity_x_bytes < compact_bytes) {
+    if (velocity_x == nullptr) {
         return 2003;
     }
-    if (velocity_y == nullptr || velocity_y_bytes < compact_bytes) {
+    if (velocity_y == nullptr) {
         return 2004;
     }
-    if (velocity_z == nullptr || velocity_z_bytes < compact_bytes) {
+    if (velocity_z == nullptr) {
         return 2005;
     }
-    if (destination == nullptr || destination_bytes < compact_bytes) {
+    if (destination == nullptr) {
         return 2006;
     }
 

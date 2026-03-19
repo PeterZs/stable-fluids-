@@ -28,42 +28,44 @@ Error code scheme:
 1003  : invalid dt
 1004  : invalid iteration count
 1005  : invalid source radius
-2xxx  : buffer/workspace errors
+2xxx  : buffer errors
 2001  : invalid density buffer
 2003  : invalid velocity_x buffer
 2004  : invalid velocity_y buffer
 2005  : invalid velocity_z buffer
 2006  : invalid destination buffer
-2007  : invalid workspace buffer
+2007  : invalid temporary density buffer
+2008  : invalid temporary velocity_x buffer
+2009  : invalid temporary velocity_y buffer
+2010  : invalid temporary velocity_z buffer
+2011  : invalid temporary previous density buffer
+2012  : invalid temporary previous velocity_x buffer
+2013  : invalid temporary previous velocity_y buffer
+2014  : invalid temporary previous velocity_z buffer
+2015  : invalid temporary pressure buffer
+2016  : invalid temporary divergence buffer
 5xxx  : CUDA runtime or kernel launch failure
 5001  : CUDA call failed
 */
 
 STABLE_FLUIDS_API uint64_t stable_fluids_scalar_field_bytes(int32_t nx, int32_t ny, int32_t nz);
-STABLE_FLUIDS_API uint64_t stable_fluids_workspace_bytes(int32_t nx, int32_t ny, int32_t nz);
+STABLE_FLUIDS_API uint64_t stable_fluids_temporary_field_bytes(int32_t nx, int32_t ny, int32_t nz);
 
 STABLE_FLUIDS_API int32_t stable_fluids_clear_async(
     void* density,
-    uint64_t density_bytes,
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     void* cuda_stream);
 
 STABLE_FLUIDS_API int32_t stable_fluids_add_density_splat_async(
     void* density,
-    uint64_t density_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     float center_x,
     float center_y,
     float center_z,
@@ -73,15 +75,11 @@ STABLE_FLUIDS_API int32_t stable_fluids_add_density_splat_async(
 
 STABLE_FLUIDS_API int32_t stable_fluids_add_force_splat_async(
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     float center_x,
     float center_y,
     float center_z,
@@ -93,19 +91,23 @@ STABLE_FLUIDS_API int32_t stable_fluids_add_force_splat_async(
 
 STABLE_FLUIDS_API int32_t stable_fluids_step_async(
     void* density,
-    uint64_t density_bytes,
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
     float cell_size,
-    void* workspace,
-    uint64_t workspace_bytes,
+    void* temporary_density,
+    void* temporary_velocity_x,
+    void* temporary_velocity_y,
+    void* temporary_velocity_z,
+    void* temporary_previous_density,
+    void* temporary_previous_velocity_x,
+    void* temporary_previous_velocity_y,
+    void* temporary_previous_velocity_z,
+    void* temporary_pressure,
+    void* temporary_divergence,
     float dt,
     float viscosity,
     float diffusion,
@@ -118,17 +120,12 @@ STABLE_FLUIDS_API int32_t stable_fluids_step_async(
 
 STABLE_FLUIDS_API int32_t stable_fluids_compute_velocity_magnitude_async(
     void* velocity_x,
-    uint64_t velocity_x_bytes,
     void* velocity_y,
-    uint64_t velocity_y_bytes,
     void* velocity_z,
-    uint64_t velocity_z_bytes,
     void* destination,
-    uint64_t destination_bytes,
     int32_t nx,
     int32_t ny,
     int32_t nz,
-    float cell_size,
     void* cuda_stream);
 
 #ifdef __cplusplus
