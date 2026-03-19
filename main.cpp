@@ -10,7 +10,7 @@
 
 namespace {
 
-bool cuda_ok(cudaError_t status, const char* what) {
+bool cuda_ok(const cudaError_t status, const char* what) {
     if (status == cudaSuccess) {
         return true;
     }
@@ -18,21 +18,13 @@ bool cuda_ok(cudaError_t status, const char* what) {
     return false;
 }
 
-bool stable_ok(int32_t code, const char* what, const StableFluidsContext* context = nullptr) {
+bool stable_ok(const int32_t code, const char* what) {
     if (code == STABLE_FLUIDS_SUCCESS) {
         return true;
     }
-
-    const uint64_t message_length =
-        context != nullptr ? stable_fluids_context_last_error_length(context) : stable_fluids_last_error_length();
-    std::vector<char> message(static_cast<std::size_t>(message_length + 1), '\0');
-    const int32_t copy_code = context != nullptr
-        ? stable_fluids_copy_context_last_error(context, message.data(), static_cast<uint64_t>(message.size()))
-        : stable_fluids_copy_last_error(message.data(), static_cast<uint64_t>(message.size()));
-
     std::cerr << what << " failed (" << code << ")";
-    if (copy_code == STABLE_FLUIDS_SUCCESS && !message.empty() && message[0] != '\0') {
-        std::cerr << ": " << message.data();
+    if (const char* message = stable_fluids_last_error(); message != nullptr && message[0] != '\0') {
+        std::cerr << ": " << message;
     }
     std::cerr << '\n';
     return false;
@@ -42,144 +34,82 @@ bool stable_ok(int32_t code, const char* what, const StableFluidsContext* contex
 
 int main() {
     nvtx3::scoped_range app_range{"stable.demo"};
-    StableFluidsContextDesc context_desc = stable_fluids_context_desc_default();
-    context_desc.nx = 96;
-    context_desc.ny = 96;
-    context_desc.nz = 96;
-    context_desc.dt = 1.0f / 60.0f;
-    context_desc.cell_size = 1.0f;
-    context_desc.viscosity = 0.00015f;
-    context_desc.diffusion = 0.00005f;
-    context_desc.diffuse_iterations = 24;
-    context_desc.pressure_iterations = 96;
 
-    StableFluidsContext* context = stable_fluids_context_create(&context_desc);
-    if (context == nullptr) {
-        stable_ok(STABLE_FLUIDS_ERROR_RUNTIME, "stable_fluids_context_create");
-        return EXIT_FAILURE;
-    }
+    constexpr int32_t nx = 96;
+    constexpr int32_t ny = 96;
+    constexpr int32_t nz = 96;
+    constexpr float cell_size = 1.0f;
+    constexpr float dt = 1.0f / 60.0f;
+    constexpr float viscosity = 0.00015f;
+    constexpr float diffusion = 0.00005f;
+    constexpr int32_t diffuse_iterations = 24;
+    constexpr int32_t pressure_iterations = 96;
+    constexpr int32_t block_x = 8;
+    constexpr int32_t block_y = 8;
+    constexpr int32_t block_z = 8;
 
-    const uint64_t element_count = stable_fluids_context_required_elements(context);
-    const uint64_t scalar_bytes = stable_fluids_context_required_scalar_field_bytes(context);
-    const uint64_t velocity_x_bytes = stable_fluids_context_required_vector_field_component_bytes(context, VECTOR_FIELD_COMPONENT_X);
-    const uint64_t velocity_y_bytes = stable_fluids_context_required_vector_field_component_bytes(context, VECTOR_FIELD_COMPONENT_Y);
-    const uint64_t velocity_z_bytes = stable_fluids_context_required_vector_field_component_bytes(context, VECTOR_FIELD_COMPONENT_Z);
+    const uint64_t scalar_bytes = stable_fluids_scalar_field_bytes(nx, ny, nz);
+    const uint64_t workspace_bytes = stable_fluids_workspace_bytes(nx, ny, nz);
+    const uint64_t element_count = scalar_bytes / sizeof(float);
 
     float* density = nullptr;
     float* velocity_x = nullptr;
     float* velocity_y = nullptr;
     float* velocity_z = nullptr;
+    void* workspace = nullptr;
     cudaStream_t stream = nullptr;
 
     if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&density), scalar_bytes), "cudaMalloc density") ||
-        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_x), velocity_x_bytes), "cudaMalloc velocity_x") ||
-        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_y), velocity_y_bytes), "cudaMalloc velocity_y") ||
-        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_z), velocity_z_bytes), "cudaMalloc velocity_z")) {
+        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_x), scalar_bytes), "cudaMalloc velocity_x") ||
+        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_y), scalar_bytes), "cudaMalloc velocity_y") ||
+        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&velocity_z), scalar_bytes), "cudaMalloc velocity_z") ||
+        !cuda_ok(cudaMalloc(&workspace, workspace_bytes), "cudaMalloc workspace") ||
+        !cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags")) {
         cudaFree(density);
         cudaFree(velocity_x);
         cudaFree(velocity_y);
         cudaFree(velocity_z);
-        stable_fluids_context_destroy(context);
+        cudaFree(workspace);
+        if (stream != nullptr) {
+            cudaStreamDestroy(stream);
+        }
         return EXIT_FAILURE;
     }
 
-    if (!cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags")) {
-        cudaFree(density);
-        cudaFree(velocity_x);
-        cudaFree(velocity_y);
-        cudaFree(velocity_z);
-        stable_fluids_context_destroy(context);
-        return EXIT_FAILURE;
-    }
-
-    const FieldGridDesc grid{
-        .nx = context_desc.nx,
-        .ny = context_desc.ny,
-        .nz = context_desc.nz,
-        .cell_size = context_desc.cell_size,
-    };
-    const auto make_buffer = [](void* data, uint64_t size_bytes) {
-        return FieldBufferView{
-            .data = data,
-            .size_bytes = size_bytes,
-            .format = FIELD_FORMAT_F32,
-            .memory_type = FIELD_MEMORY_TYPE_CUDA_DEVICE,
-        };
-    };
-    StableFluidsFieldSet fields{
-        .density = ScalarField{
-            .grid = grid,
-            .values = make_buffer(density, scalar_bytes),
-        },
-        .velocity = VectorField{
-            .grid = grid,
-            .layout = VECTOR_FIELD_LAYOUT_CELL_CENTERED,
-            .x = make_buffer(velocity_x, velocity_x_bytes),
-            .y = make_buffer(velocity_y, velocity_y_bytes),
-            .z = make_buffer(velocity_z, velocity_z_bytes),
-        },
-    };
-
-    StableFluidsDensitySplatDesc density_splat{};
-    density_splat.center_x = static_cast<float>(context_desc.nx) * 0.5f;
-    density_splat.center_y = static_cast<float>(context_desc.ny) * 0.33f;
-    density_splat.center_z = static_cast<float>(context_desc.nz) * 0.5f;
-    density_splat.radius = 5.0f;
-    density_splat.amount = 6.0f;
-
-    StableFluidsForceSplatDesc force_splat{};
-    force_splat.center_x = density_splat.center_x;
-    force_splat.center_y = density_splat.center_y;
-    force_splat.center_z = density_splat.center_z;
-    force_splat.radius = 6.0f;
-    force_splat.force_x = 1.25f;
-    force_splat.force_y = 2.5f;
-    force_splat.force_z = 0.75f;
-
-    if (!stable_ok(stable_fluids_fields_clear_async(context, &fields, stream), "stable_fluids_fields_clear_async", context) ||
-        !stable_ok(stable_fluids_fields_add_density_splat_async(context, &fields, &density_splat, stream), "stable_fluids_fields_add_density_splat_async", context) ||
-        !stable_ok(stable_fluids_fields_add_force_splat_async(context, &fields, &force_splat, stream), "stable_fluids_fields_add_force_splat_async", context)) {
+    if (!stable_ok(stable_fluids_clear_async(density, scalar_bytes, velocity_x, scalar_bytes, velocity_y, scalar_bytes, velocity_z, scalar_bytes, nx, ny, nz, cell_size, stream), "stable_fluids_clear_async") ||
+        !stable_ok(stable_fluids_add_density_splat_async(density, scalar_bytes, nx, ny, nz, cell_size, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 5.0f, 6.0f, stream), "stable_fluids_add_density_splat_async") ||
+        !stable_ok(stable_fluids_add_force_splat_async(velocity_x, scalar_bytes, velocity_y, scalar_bytes, velocity_z, scalar_bytes, nx, ny, nz, cell_size, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 6.0f, 1.25f, 2.5f, 0.75f, stream), "stable_fluids_add_force_splat_async")) {
         cudaStreamDestroy(stream);
         cudaFree(density);
         cudaFree(velocity_x);
         cudaFree(velocity_y);
         cudaFree(velocity_z);
-        stable_fluids_context_destroy(context);
+        cudaFree(workspace);
         return EXIT_FAILURE;
     }
 
     for (int frame = 0; frame < 24; ++frame) {
         nvtx3::scoped_range frame_range{"stable.demo.frame"};
         if (frame < 8) {
-            StableFluidsDensitySplatDesc pulse_density = density_splat;
-            pulse_density.radius = 4.0f;
-            pulse_density.amount = 1.5f;
-
-            StableFluidsForceSplatDesc pulse_force = force_splat;
-            pulse_force.radius = 4.0f;
-            pulse_force.force_x = 0.0f;
-            pulse_force.force_y = 0.5f;
-            pulse_force.force_z = 0.0f;
-
-            if (!stable_ok(stable_fluids_fields_add_density_splat_async(context, &fields, &pulse_density, stream), "stable_fluids_fields_add_density_splat_async", context) ||
-                !stable_ok(stable_fluids_fields_add_force_splat_async(context, &fields, &pulse_force, stream), "stable_fluids_fields_add_force_splat_async", context)) {
+            if (!stable_ok(stable_fluids_add_density_splat_async(density, scalar_bytes, nx, ny, nz, cell_size, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 4.0f, 1.5f, stream), "stable_fluids_add_density_splat_async") ||
+                !stable_ok(stable_fluids_add_force_splat_async(velocity_x, scalar_bytes, velocity_y, scalar_bytes, velocity_z, scalar_bytes, nx, ny, nz, cell_size, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, 4.0f, 0.0f, 0.5f, 0.0f, stream), "stable_fluids_add_force_splat_async")) {
                 cudaStreamDestroy(stream);
                 cudaFree(density);
                 cudaFree(velocity_x);
                 cudaFree(velocity_y);
                 cudaFree(velocity_z);
-                stable_fluids_context_destroy(context);
+                cudaFree(workspace);
                 return EXIT_FAILURE;
             }
         }
 
-        if (!stable_ok(stable_fluids_fields_step_async(context, &fields, stream), "stable_fluids_fields_step_async", context)) {
+        if (!stable_ok(stable_fluids_step_async(density, scalar_bytes, velocity_x, scalar_bytes, velocity_y, scalar_bytes, velocity_z, scalar_bytes, nx, ny, nz, cell_size, workspace, workspace_bytes, dt, viscosity, diffusion, diffuse_iterations, pressure_iterations, block_x, block_y, block_z, stream), "stable_fluids_step_async")) {
             cudaStreamDestroy(stream);
             cudaFree(density);
             cudaFree(velocity_x);
             cudaFree(velocity_y);
             cudaFree(velocity_z);
-            stable_fluids_context_destroy(context);
+            cudaFree(workspace);
             return EXIT_FAILURE;
         }
     }
@@ -190,18 +120,18 @@ int main() {
         cudaFree(velocity_x);
         cudaFree(velocity_y);
         cudaFree(velocity_z);
-        stable_fluids_context_destroy(context);
+        cudaFree(workspace);
         return EXIT_FAILURE;
     }
 
     std::vector<float> host_density(static_cast<std::size_t>(element_count), 0.0f);
-    if (!cuda_ok(cudaMemcpy(host_density.data(), density, scalar_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy density to host")) {
+    if (!cuda_ok(cudaMemcpy(host_density.data(), density, scalar_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy density")) {
         cudaStreamDestroy(stream);
         cudaFree(density);
         cudaFree(velocity_x);
         cudaFree(velocity_y);
         cudaFree(velocity_z);
-        stable_fluids_context_destroy(context);
+        cudaFree(workspace);
         return EXIT_FAILURE;
     }
 
@@ -209,7 +139,7 @@ int main() {
     const float peak_density = host_density.empty() ? 0.0f : *std::max_element(host_density.begin(), host_density.end());
 
     std::cout << "stable-fluids-app\n";
-    std::cout << "grid: " << context_desc.nx << " x " << context_desc.ny << " x " << context_desc.nz << '\n';
+    std::cout << "grid: " << nx << " x " << ny << " x " << nz << '\n';
     std::cout << "elements: " << static_cast<unsigned long long>(element_count) << '\n';
     std::cout << "total density: " << total_density << '\n';
     std::cout << "peak density: " << peak_density << '\n';
@@ -219,6 +149,6 @@ int main() {
     cudaFree(velocity_x);
     cudaFree(velocity_y);
     cudaFree(velocity_z);
-    stable_fluids_context_destroy(context);
+    cudaFree(workspace);
     return EXIT_SUCCESS;
 }

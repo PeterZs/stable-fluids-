@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 #include <new>
@@ -11,18 +10,29 @@
 #include <utility>
 
 namespace stable_fluids {
-    using SolverDesc   = StableFluidsContextDesc;
-    using BufferView   = FieldBufferView;
-    using ScalarFieldT = ScalarField;
-    using VectorFieldT = VectorField;
-    using FieldSet     = StableFluidsFieldSet;
-    using DensitySplat = StableFluidsDensitySplatDesc;
-    using ForceSplat   = StableFluidsForceSplatDesc;
-    using Stream       = cudaStream_t;
+    struct FieldGridDesc {
+        int32_t nx;
+        int32_t ny;
+        int32_t nz;
+        float cell_size;
+    };
+
+    struct StepParams {
+        float dt;
+        float viscosity;
+        float diffusion;
+        int32_t diffuse_iterations;
+        int32_t pressure_iterations;
+        int32_t block_x;
+        int32_t block_y;
+        int32_t block_z;
+    };
+
+    using Stream = cudaStream_t;
+
+    thread_local std::string g_last_error;
 
     namespace {
-
-        thread_local std::string g_last_error;
 
         inline void check_cuda(cudaError_t status, const char* what) {
             if (status == cudaSuccess) {
@@ -31,8 +41,16 @@ namespace stable_fluids {
             throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
         }
 
-        inline dim3 make_block(const SolverDesc& desc) {
-            return dim3(static_cast<unsigned>(std::max(desc.block_x, 1)), static_cast<unsigned>(std::max(desc.block_y, 1)), static_cast<unsigned>(std::max(desc.block_z, 1)));
+        inline std::uint64_t ghosted_bytes(const FieldGridDesc& grid) {
+            return static_cast<std::uint64_t>(grid.nx + 2) * static_cast<std::uint64_t>(grid.ny + 2) * static_cast<std::uint64_t>(grid.nz + 2) * sizeof(float);
+        }
+
+        inline std::uint64_t workspace_bytes(const FieldGridDesc& grid) {
+            return ghosted_bytes(grid) * 10ull;
+        }
+
+        inline dim3 make_block(const StepParams& params) {
+            return dim3(static_cast<unsigned>(std::max(params.block_x, 1)), static_cast<unsigned>(std::max(params.block_y, 1)), static_cast<unsigned>(std::max(params.block_z, 1)));
         }
 
         inline dim3 make_grid(int nx, int ny, int nz, const dim3& block) {
@@ -312,456 +330,7 @@ namespace stable_fluids {
 
     } // namespace
 
-    class Solver3D {
-    public:
-        explicit Solver3D(const SolverDesc& desc);
-        ~Solver3D();
-
-        Solver3D(const Solver3D&)            = delete;
-        Solver3D& operator=(const Solver3D&) = delete;
-        Solver3D(Solver3D&&)                 = delete;
-        Solver3D& operator=(Solver3D&&)      = delete;
-
-        [[nodiscard]] std::uint64_t required_elements() const noexcept;
-        [[nodiscard]] std::uint64_t required_scalar_field_bytes() const noexcept;
-        [[nodiscard]] std::uint64_t required_vector_field_component_bytes(uint32_t component) const noexcept;
-
-        void zero_fields(const FieldSet& fields, Stream stream);
-        void add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream);
-        void add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream);
-        void step(const FieldSet& fields, Stream stream);
-        void snapshot_density(const FieldSet& fields, const ScalarFieldT& destination, Stream stream);
-        void snapshot_velocity_magnitude(const FieldSet& fields, const ScalarFieldT& destination, Stream stream);
-
-    private:
-        void validate_fields_(const FieldSet& fields) const;
-        void fill_field_(float* field, float value, Stream stream);
-        void zero_compact_field_(float* field, Stream stream);
-        void copy_compact_to_ghosted_(float* ghosted, const float* compact, Stream stream);
-        void copy_ghosted_to_compact_(float* compact, const float* ghosted, Stream stream);
-        void set_boundary_(int field_kind, float* field, Stream stream);
-        void advect_scalar_(float* dst, const float* src, const float* u, const float* v, const float* w, Stream stream);
-        void advect_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel, Stream stream);
-        void diffuse_scalar_(float* dst, const float* src, Stream stream);
-        void diffuse_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, Stream stream);
-        void project_(float* u, float* v, float* w, Stream stream);
-
-        SolverDesc desc_{};
-        std::size_t interior_cell_count_ = 0;
-        std::size_t total_cell_count_    = 0;
-        std::size_t compact_bytes_       = 0;
-        std::size_t ghosted_bytes_       = 0;
-        int nx_total_                    = 0;
-        int ny_total_                    = 0;
-        int nz_total_                    = 0;
-
-        float* density_      = nullptr;
-        float* u_            = nullptr;
-        float* v_            = nullptr;
-        float* w_            = nullptr;
-        float* density_prev_ = nullptr;
-        float* u_prev_       = nullptr;
-        float* v_prev_       = nullptr;
-        float* w_prev_       = nullptr;
-        float* pressure_     = nullptr;
-        float* divergence_   = nullptr;
-    };
-
-    Solver3D::Solver3D(const SolverDesc& desc) : desc_(desc) {
-        if (desc_.nx <= 0 || desc_.ny <= 0 || desc_.nz <= 0) {
-            throw std::invalid_argument("grid dimensions must be positive");
-        }
-        if (desc_.dt <= 0.0f || desc_.cell_size <= 0.0f) {
-            throw std::invalid_argument("dt and cell_size must be positive");
-        }
-        if (desc_.diffuse_iterations <= 0 || desc_.pressure_iterations <= 0) {
-            throw std::invalid_argument("iteration counts must be positive");
-        }
-
-        nx_total_            = desc_.nx + 2;
-        ny_total_            = desc_.ny + 2;
-        nz_total_            = desc_.nz + 2;
-        interior_cell_count_ = static_cast<std::size_t>(desc_.nx) * static_cast<std::size_t>(desc_.ny) * static_cast<std::size_t>(desc_.nz);
-        total_cell_count_    = static_cast<std::size_t>(nx_total_) * static_cast<std::size_t>(ny_total_) * static_cast<std::size_t>(nz_total_);
-        compact_bytes_       = interior_cell_count_ * sizeof(float);
-        ghosted_bytes_       = total_cell_count_ * sizeof(float);
-
-        auto allocate = [this](float*& field) { check_cuda(cudaMalloc(reinterpret_cast<void**>(&field), ghosted_bytes_), "cudaMalloc ghosted field"); };
-
-        allocate(density_);
-        allocate(u_);
-        allocate(v_);
-        allocate(w_);
-        allocate(density_prev_);
-        allocate(u_prev_);
-        allocate(v_prev_);
-        allocate(w_prev_);
-        allocate(pressure_);
-        allocate(divergence_);
-
-        fill_field_(density_, 0.0f, nullptr);
-        fill_field_(u_, 0.0f, nullptr);
-        fill_field_(v_, 0.0f, nullptr);
-        fill_field_(w_, 0.0f, nullptr);
-        fill_field_(density_prev_, 0.0f, nullptr);
-        fill_field_(u_prev_, 0.0f, nullptr);
-        fill_field_(v_prev_, 0.0f, nullptr);
-        fill_field_(w_prev_, 0.0f, nullptr);
-        fill_field_(pressure_, 0.0f, nullptr);
-        fill_field_(divergence_, 0.0f, nullptr);
-        check_cuda(cudaDeviceSynchronize(), "constructor synchronize");
-    }
-
-    Solver3D::~Solver3D() {
-        cudaFree(density_);
-        cudaFree(u_);
-        cudaFree(v_);
-        cudaFree(w_);
-        cudaFree(density_prev_);
-        cudaFree(u_prev_);
-        cudaFree(v_prev_);
-        cudaFree(w_prev_);
-        cudaFree(pressure_);
-        cudaFree(divergence_);
-    }
-
-    std::uint64_t Solver3D::required_elements() const noexcept {
-        return static_cast<std::uint64_t>(interior_cell_count_);
-    }
-
-    std::uint64_t Solver3D::required_scalar_field_bytes() const noexcept {
-        return static_cast<std::uint64_t>(compact_bytes_);
-    }
-
-    std::uint64_t Solver3D::required_vector_field_component_bytes(uint32_t component) const noexcept {
-        return component <= VECTOR_FIELD_COMPONENT_Z ? static_cast<std::uint64_t>(compact_bytes_) : 0;
-    }
-
-    void Solver3D::validate_fields_(const FieldSet& fields) const {
-        const auto validate_grid = [this](const FieldGridDesc& grid, const char* name) {
-            if (grid.nx != desc_.nx || grid.ny != desc_.ny || grid.nz != desc_.nz) {
-                throw std::invalid_argument(std::string(name) + " grid dimensions must match the context");
-            }
-            if (std::fabs(grid.cell_size - desc_.cell_size) > 1.0e-6f) {
-                throw std::invalid_argument(std::string(name) + " cell_size must match the context");
-            }
-        };
-
-        const auto validate_buffer = [this](const BufferView& view, const char* name) {
-            if (view.data == nullptr) {
-                throw std::invalid_argument(std::string(name) + " must provide a non-null device pointer");
-            }
-            if (view.format != FIELD_FORMAT_F32) {
-                throw std::invalid_argument(std::string(name) + " must use FIELD_FORMAT_F32");
-            }
-            if (view.memory_type != FIELD_MEMORY_TYPE_CUDA_DEVICE) {
-                throw std::invalid_argument(std::string(name) + " must use FIELD_MEMORY_TYPE_CUDA_DEVICE");
-            }
-            if (view.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
-                throw std::invalid_argument(std::string(name) + " size_bytes is smaller than nx*ny*nz*sizeof(float)");
-            }
-        };
-
-        validate_grid(fields.density.grid, "density");
-        validate_buffer(fields.density.values, "density.values");
-
-        validate_grid(fields.velocity.grid, "velocity");
-        if (fields.velocity.layout != VECTOR_FIELD_LAYOUT_CELL_CENTERED) {
-            throw std::invalid_argument("velocity.layout must be VECTOR_FIELD_LAYOUT_CELL_CENTERED");
-        }
-        validate_buffer(fields.velocity.x, "velocity.x");
-        validate_buffer(fields.velocity.y, "velocity.y");
-        validate_buffer(fields.velocity.z, "velocity.z");
-    }
-
-    void Solver3D::fill_field_(float* field, float value, Stream stream) {
-        constexpr int block_size = 256;
-        const int grid_size      = static_cast<int>((total_cell_count_ + block_size - 1) / block_size);
-        fill_kernel<<<grid_size, block_size, 0, stream>>>(field, value, total_cell_count_);
-        check_cuda(cudaGetLastError(), "fill_kernel launch");
-    }
-
-    void Solver3D::zero_compact_field_(float* field, Stream stream) {
-        constexpr int block_size = 256;
-        const int grid_size      = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
-        zero_compact_field_kernel<<<grid_size, block_size, 0, stream>>>(field, interior_cell_count_);
-        check_cuda(cudaGetLastError(), "zero_compact_field_kernel launch");
-    }
-
-    void Solver3D::copy_compact_to_ghosted_(float* ghosted, const float* compact, Stream stream) {
-        constexpr int block_size = 256;
-        const int grid_size      = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
-        copy_compact_to_ghosted_kernel<<<grid_size, block_size, 0, stream>>>(ghosted, compact, desc_.nx, desc_.ny, nx_total_, ny_total_, interior_cell_count_);
-        check_cuda(cudaGetLastError(), "copy_compact_to_ghosted_kernel launch");
-    }
-
-    void Solver3D::copy_ghosted_to_compact_(float* compact, const float* ghosted, Stream stream) {
-        constexpr int block_size = 256;
-        const int grid_size      = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
-        copy_ghosted_to_compact_kernel<<<grid_size, block_size, 0, stream>>>(compact, ghosted, desc_.nx, desc_.ny, nx_total_, ny_total_, interior_cell_count_);
-        check_cuda(cudaGetLastError(), "copy_ghosted_to_compact_kernel launch");
-    }
-
-    void Solver3D::set_boundary_(int field_kind, float* field, Stream stream) {
-        const dim3 block = make_block(desc_);
-        const dim3 grid  = make_grid(nx_total_, ny_total_, nz_total_, block);
-        set_boundary_kernel<<<grid, block, 0, stream>>>(field_kind, field, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-        check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
-    }
-
-    void Solver3D::zero_fields(const FieldSet& fields, Stream stream) {
-        nvtx3::scoped_range range{"stable.clear"};
-        validate_fields_(fields);
-        zero_compact_field_(reinterpret_cast<float*>(fields.density.values.data), stream);
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity.x.data), stream);
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity.y.data), stream);
-        zero_compact_field_(reinterpret_cast<float*>(fields.velocity.z.data), stream);
-    }
-
-    void Solver3D::add_density_sphere(const FieldSet& fields, float x, float y, float z, float radius, float amount, Stream stream) {
-        nvtx3::scoped_range range{"stable.add_density_splat"};
-        validate_fields_(fields);
-        const dim3 block = make_block(desc_);
-        const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        splat_density_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.density.values.data), x, y, z, fmaxf(radius, 1.0f), amount, desc_.nx, desc_.ny, desc_.nz);
-        check_cuda(cudaGetLastError(), "splat_density_compact_kernel launch");
-    }
-
-    void Solver3D::add_force_sphere(const FieldSet& fields, float x, float y, float z, float radius, float fx, float fy, float fz, Stream stream) {
-        nvtx3::scoped_range range{"stable.add_force_splat"};
-        validate_fields_(fields);
-        const dim3 block = make_block(desc_);
-        const dim3 grid  = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        splat_force_compact_kernel<<<grid, block, 0, stream>>>(reinterpret_cast<float*>(fields.velocity.x.data), reinterpret_cast<float*>(fields.velocity.y.data), reinterpret_cast<float*>(fields.velocity.z.data), x, y, z, fmaxf(radius, 1.0f), fx, fy, fz, desc_.nx, desc_.ny, desc_.nz);
-        check_cuda(cudaGetLastError(), "splat_force_compact_kernel launch");
-    }
-
-    void Solver3D::advect_scalar_(float* dst, const float* src, const float* u, const float* v, const float* w, Stream stream) {
-        const dim3 block      = make_block(desc_);
-        const dim3 grid       = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        const float dt_over_h = desc_.dt / desc_.cell_size;
-        advect_scalar_kernel<<<grid, block, 0, stream>>>(dst, src, u, v, w, dt_over_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-        check_cuda(cudaGetLastError(), "advect_scalar_kernel launch");
-        set_boundary_(0, dst, stream);
-    }
-
-    void Solver3D::advect_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel, Stream stream) {
-        const dim3 block      = make_block(desc_);
-        const dim3 grid       = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        const float dt_over_h = desc_.dt / desc_.cell_size;
-        advect_velocity_kernel<<<grid, block, 0, stream>>>(u_dst, v_dst, w_dst, u_src, v_src, w_src, u_vel, v_vel, w_vel, dt_over_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-        check_cuda(cudaGetLastError(), "advect_velocity_kernel launch");
-        set_boundary_(1, u_dst, stream);
-        set_boundary_(2, v_dst, stream);
-        set_boundary_(3, w_dst, stream);
-    }
-
-    void Solver3D::diffuse_scalar_(float* dst, const float* src, Stream stream) {
-        if (desc_.diffusion <= 0.0f) {
-            check_cuda(cudaMemcpyAsync(dst, src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse bypass");
-            set_boundary_(0, dst, stream);
-            return;
-        }
-
-        check_cuda(cudaMemcpyAsync(dst, src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse init");
-
-        const dim3 block  = make_block(desc_);
-        const dim3 grid   = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        const float alpha = desc_.dt * desc_.diffusion / (desc_.cell_size * desc_.cell_size);
-        const float denom = 1.0f + 6.0f * alpha;
-
-        set_boundary_(0, dst, stream);
-        for (int iteration = 0; iteration < desc_.diffuse_iterations; ++iteration) {
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(dst, src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar red launch");
-            set_boundary_(0, dst, stream);
-
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(dst, src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar black launch");
-            set_boundary_(0, dst, stream);
-        }
-    }
-
-    void Solver3D::diffuse_velocity_(float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, Stream stream) {
-        if (desc_.viscosity <= 0.0f) {
-            check_cuda(cudaMemcpyAsync(u_dst, u_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse bypass");
-            check_cuda(cudaMemcpyAsync(v_dst, v_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse bypass");
-            check_cuda(cudaMemcpyAsync(w_dst, w_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse bypass");
-            set_boundary_(1, u_dst, stream);
-            set_boundary_(2, v_dst, stream);
-            set_boundary_(3, w_dst, stream);
-            return;
-        }
-
-        check_cuda(cudaMemcpyAsync(u_dst, u_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse init");
-        check_cuda(cudaMemcpyAsync(v_dst, v_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse init");
-        check_cuda(cudaMemcpyAsync(w_dst, w_src, ghosted_bytes_, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse init");
-
-        const dim3 block  = make_block(desc_);
-        const dim3 grid   = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        const float alpha = desc_.dt * desc_.viscosity / (desc_.cell_size * desc_.cell_size);
-        const float denom = 1.0f + 6.0f * alpha;
-
-        set_boundary_(1, u_dst, stream);
-        set_boundary_(2, v_dst, stream);
-        set_boundary_(3, w_dst, stream);
-
-        for (int iteration = 0; iteration < desc_.diffuse_iterations; ++iteration) {
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(u_dst, u_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(v_dst, v_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(w_dst, w_src, alpha, denom, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity red launch");
-            set_boundary_(1, u_dst, stream);
-            set_boundary_(2, v_dst, stream);
-            set_boundary_(3, w_dst, stream);
-
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(u_dst, u_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(v_dst, v_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            rbgs_diffuse_kernel<<<grid, block, 0, stream>>>(w_dst, w_src, alpha, denom, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity black launch");
-            set_boundary_(1, u_dst, stream);
-            set_boundary_(2, v_dst, stream);
-            set_boundary_(3, w_dst, stream);
-        }
-    }
-
-    void Solver3D::project_(float* u, float* v, float* w, Stream stream) {
-        nvtx3::scoped_range range{"stable.step.project"};
-        const dim3 block       = make_block(desc_);
-        const dim3 grid        = make_grid(desc_.nx, desc_.ny, desc_.nz, block);
-        const float half_inv_h = 0.5f / desc_.cell_size;
-        const float h2         = desc_.cell_size * desc_.cell_size;
-
-        divergence_kernel<<<grid, block, 0, stream>>>(divergence_, u, v, w, half_inv_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-        check_cuda(cudaGetLastError(), "divergence_kernel launch");
-        set_boundary_(0, divergence_, stream);
-
-        fill_field_(pressure_, 0.0f, stream);
-        set_boundary_(0, pressure_, stream);
-
-        for (int iteration = 0; iteration < desc_.pressure_iterations; ++iteration) {
-            rbgs_pressure_kernel<<<grid, block, 0, stream>>>(pressure_, divergence_, h2, 0, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "rbgs_pressure_kernel red launch");
-            set_boundary_(0, pressure_, stream);
-
-            rbgs_pressure_kernel<<<grid, block, 0, stream>>>(pressure_, divergence_, h2, 1, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-            check_cuda(cudaGetLastError(), "rbgs_pressure_kernel black launch");
-            set_boundary_(0, pressure_, stream);
-        }
-
-        set_boundary_(0, pressure_, stream);
-        subtract_gradient_kernel<<<grid, block, 0, stream>>>(u, v, w, pressure_, half_inv_h, desc_.nx, desc_.ny, desc_.nz, nx_total_, ny_total_);
-        check_cuda(cudaGetLastError(), "subtract_gradient_kernel launch");
-        set_boundary_(1, u, stream);
-        set_boundary_(2, v, stream);
-        set_boundary_(3, w, stream);
-    }
-
-    void Solver3D::step(const FieldSet& fields, Stream stream) {
-        nvtx3::scoped_range step_range{"stable.step"};
-        validate_fields_(fields);
-
-        copy_compact_to_ghosted_(density_, reinterpret_cast<const float*>(fields.density.values.data), stream);
-        copy_compact_to_ghosted_(u_, reinterpret_cast<const float*>(fields.velocity.x.data), stream);
-        copy_compact_to_ghosted_(v_, reinterpret_cast<const float*>(fields.velocity.y.data), stream);
-        copy_compact_to_ghosted_(w_, reinterpret_cast<const float*>(fields.velocity.z.data), stream);
-
-        set_boundary_(0, density_, stream);
-        set_boundary_(1, u_, stream);
-        set_boundary_(2, v_, stream);
-        set_boundary_(3, w_, stream);
-
-        {
-            nvtx3::scoped_range range{"stable.step.advect_velocity"};
-            advect_velocity_(u_prev_, v_prev_, w_prev_, u_, v_, w_, u_, v_, w_, stream);
-        }
-        {
-            nvtx3::scoped_range range{"stable.step.diffuse_velocity"};
-            diffuse_velocity_(u_, v_, w_, u_prev_, v_prev_, w_prev_, stream);
-        }
-        project_(u_, v_, w_, stream);
-
-        {
-            nvtx3::scoped_range range{"stable.step.advect_density"};
-            advect_scalar_(density_prev_, density_, u_, v_, w_, stream);
-        }
-        {
-            nvtx3::scoped_range range{"stable.step.diffuse_density"};
-            diffuse_scalar_(density_, density_prev_, stream);
-        }
-
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.density.values.data), density_, stream);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity.x.data), u_, stream);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity.y.data), v_, stream);
-        copy_ghosted_to_compact_(reinterpret_cast<float*>(fields.velocity.z.data), w_, stream);
-    }
-
-    void Solver3D::snapshot_density(const FieldSet& fields, const ScalarFieldT& destination, Stream stream) {
-        nvtx3::scoped_range range{"stable.snapshot_density"};
-        validate_fields_(fields);
-        if (destination.grid.nx != desc_.nx || destination.grid.ny != desc_.ny || destination.grid.nz != desc_.nz) {
-            throw std::invalid_argument("snapshot density destination grid dimensions must match the context");
-        }
-        if (std::fabs(destination.grid.cell_size - desc_.cell_size) > 1.0e-6f) {
-            throw std::invalid_argument("snapshot density destination cell_size must match the context");
-        }
-        if (destination.values.data == nullptr) {
-            throw std::invalid_argument("snapshot density destination must provide a non-null device pointer");
-        }
-        if (destination.values.format != FIELD_FORMAT_F32) {
-            throw std::invalid_argument("snapshot density destination must use FIELD_FORMAT_F32");
-        }
-        if (destination.values.memory_type != FIELD_MEMORY_TYPE_CUDA_DEVICE) {
-            throw std::invalid_argument("snapshot density destination must use FIELD_MEMORY_TYPE_CUDA_DEVICE");
-        }
-        if (destination.values.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
-            throw std::invalid_argument("snapshot density destination size_bytes is smaller than nx*ny*nz*sizeof(float)");
-        }
-
-        check_cuda(
-            cudaMemcpyAsync(destination.values.data, fields.density.values.data, compact_bytes_, cudaMemcpyDeviceToDevice, stream),
-            "cudaMemcpyAsync density snapshot");
-    }
-
-    void Solver3D::snapshot_velocity_magnitude(const FieldSet& fields, const ScalarFieldT& destination, Stream stream) {
-        nvtx3::scoped_range range{"stable.snapshot_velocity_magnitude"};
-        validate_fields_(fields);
-        if (destination.grid.nx != desc_.nx || destination.grid.ny != desc_.ny || destination.grid.nz != desc_.nz) {
-            throw std::invalid_argument("snapshot velocity magnitude destination grid dimensions must match the context");
-        }
-        if (std::fabs(destination.grid.cell_size - desc_.cell_size) > 1.0e-6f) {
-            throw std::invalid_argument("snapshot velocity magnitude destination cell_size must match the context");
-        }
-        if (destination.values.data == nullptr) {
-            throw std::invalid_argument("snapshot velocity magnitude destination must provide a non-null device pointer");
-        }
-        if (destination.values.format != FIELD_FORMAT_F32) {
-            throw std::invalid_argument("snapshot velocity magnitude destination must use FIELD_FORMAT_F32");
-        }
-        if (destination.values.memory_type != FIELD_MEMORY_TYPE_CUDA_DEVICE) {
-            throw std::invalid_argument("snapshot velocity magnitude destination must use FIELD_MEMORY_TYPE_CUDA_DEVICE");
-        }
-        if (destination.values.size_bytes < static_cast<std::uint64_t>(compact_bytes_)) {
-            throw std::invalid_argument("snapshot velocity magnitude destination size_bytes is smaller than nx*ny*nz*sizeof(float)");
-        }
-
-        constexpr int block_size = 256;
-        const int grid_size = static_cast<int>((interior_cell_count_ + block_size - 1) / block_size);
-        velocity_magnitude_kernel<<<grid_size, block_size, 0, stream>>>(
-            reinterpret_cast<float*>(destination.values.data),
-            reinterpret_cast<const float*>(fields.velocity.x.data),
-            reinterpret_cast<const float*>(fields.velocity.y.data),
-            reinterpret_cast<const float*>(fields.velocity.z.data),
-            interior_cell_count_);
-        check_cuda(cudaGetLastError(), "velocity_magnitude_kernel launch");
-    }
-
 } // namespace stable_fluids
-
-struct StableFluidsContext {
-    stable_fluids::Solver3D* solver;
-    std::string last_error;
-};
 
 namespace {
 
@@ -769,48 +338,25 @@ namespace {
         return reinterpret_cast<stable_fluids::Stream>(cuda_stream);
     }
 
-    void set_global_error(const char* message) {
+    int32_t store_error(const int32_t code, const char* message) {
         stable_fluids::g_last_error = message != nullptr ? message : "unknown stable-fluids error";
-    }
-
-    int32_t store_error(StableFluidsContext* context, int32_t code, const char* message) {
-        set_global_error(message);
-        if (context != nullptr) {
-            context->last_error = stable_fluids::g_last_error;
-        }
         return code;
     }
 
-    int32_t copy_error_text(const std::string& text, char* buffer, std::uint64_t buffer_size) {
-        if (buffer == nullptr || buffer_size == 0) {
-            return STABLE_FLUIDS_ERROR_BUFFER_TOO_SMALL;
-        }
-        if (buffer_size <= static_cast<std::uint64_t>(text.size())) {
-            buffer[0] = '\0';
-            return STABLE_FLUIDS_ERROR_BUFFER_TOO_SMALL;
-        }
-
-        std::memcpy(buffer, text.c_str(), text.size() + 1);
-        return STABLE_FLUIDS_SUCCESS;
-    }
-
     template <class Fn>
-    int32_t stable_fluids_try(StableFluidsContext* context, Fn&& fn) {
+    int32_t stable_fluids_try(Fn&& fn) {
         try {
             fn();
             stable_fluids::g_last_error.clear();
-            if (context != nullptr) {
-                context->last_error.clear();
-            }
             return STABLE_FLUIDS_SUCCESS;
         } catch (const std::bad_alloc& ex) {
-            return store_error(context, STABLE_FLUIDS_ERROR_ALLOCATION_FAILED, ex.what());
+            return store_error(STABLE_FLUIDS_ERROR_ALLOCATION_FAILED, ex.what());
         } catch (const std::invalid_argument& ex) {
-            return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, ex.what());
+            return store_error(STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, ex.what());
         } catch (const std::exception& ex) {
-            return store_error(context, STABLE_FLUIDS_ERROR_RUNTIME, ex.what());
+            return store_error(STABLE_FLUIDS_ERROR_RUNTIME, ex.what());
         } catch (...) {
-            return store_error(context, STABLE_FLUIDS_ERROR_RUNTIME, "unknown stable-fluids exception");
+            return store_error(STABLE_FLUIDS_ERROR_RUNTIME, "unknown stable-fluids exception");
         }
     }
 
@@ -818,105 +364,472 @@ namespace {
 
 extern "C" {
 
-StableFluidsContextDesc stable_fluids_context_desc_default(void) {
-    return StableFluidsContextDesc{96, 96, 96, 1.0f / 60.0f, 1.0f, 0.0001f, 0.00005f, 20, 80, 8, 8, 8};
-}
-
-StableFluidsContext* stable_fluids_context_create(const StableFluidsContextDesc* desc) {
-    if (desc == nullptr) {
-        set_global_error("stable_fluids_context_create received a null desc");
-        return nullptr;
+uint64_t stable_fluids_scalar_field_bytes(int32_t nx, int32_t ny, int32_t nz) {
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        return 0;
     }
+    return static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) * sizeof(float);
+}
 
-    try {
-        auto* context = new StableFluidsContext{new stable_fluids::Solver3D(*desc), {}};
-        stable_fluids::g_last_error.clear();
-        return context;
-    } catch (const std::exception& ex) {
-        set_global_error(ex.what());
-        return nullptr;
-    } catch (...) {
-        set_global_error("unknown stable-fluids exception");
-        return nullptr;
+uint64_t stable_fluids_workspace_bytes(int32_t nx, int32_t ny, int32_t nz) {
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        return 0;
     }
+    return stable_fluids::workspace_bytes(stable_fluids::FieldGridDesc{nx, ny, nz, 1.0f});
 }
 
-void stable_fluids_context_destroy(StableFluidsContext* context) {
-    if (context == nullptr) {
-        return;
-    }
-    delete context->solver;
-    delete context;
+int32_t stable_fluids_clear_async(
+    void* density,
+    uint64_t density_bytes,
+    void* velocity_x,
+    uint64_t velocity_x_bytes,
+    void* velocity_y,
+    uint64_t velocity_y_bytes,
+    void* velocity_z,
+    uint64_t velocity_z_bytes,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
+    float cell_size,
+    void* cuda_stream) {
+    return stable_fluids_try([&] {
+        using namespace stable_fluids;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+            throw std::invalid_argument("grid dimensions must be positive");
+        }
+        if (cell_size <= 0.0f) {
+            throw std::invalid_argument("cell_size must be positive");
+        }
+        const auto compact_bytes = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
+        const auto validate = [&](void* data, const std::uint64_t size_bytes, const char* name) {
+            if (data == nullptr) {
+                throw std::invalid_argument(std::string(name) + " must provide a non-null device pointer");
+            }
+            if (size_bytes < compact_bytes) {
+                throw std::invalid_argument(std::string(name) + " size_bytes is too small");
+            }
+        };
+        validate(density, density_bytes, "density");
+        validate(velocity_x, velocity_x_bytes, "velocity_x");
+        validate(velocity_y, velocity_y_bytes, "velocity_y");
+        validate(velocity_z, velocity_z_bytes, "velocity_z");
+
+        nvtx3::scoped_range range{"stable.clear"};
+        constexpr int block_size = 256;
+        const int grid_size = static_cast<int>((compact_bytes / sizeof(float) + block_size - 1) / block_size);
+        auto* density_f = reinterpret_cast<float*>(density);
+        auto* u = reinterpret_cast<float*>(velocity_x);
+        auto* v = reinterpret_cast<float*>(velocity_y);
+        auto* w = reinterpret_cast<float*>(velocity_z);
+        zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(density_f, compact_bytes / sizeof(float));
+        zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(u, compact_bytes / sizeof(float));
+        zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(v, compact_bytes / sizeof(float));
+        zero_compact_field_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(w, compact_bytes / sizeof(float));
+        check_cuda(cudaGetLastError(), "zero_compact_field_kernel launch");
+    });
 }
 
-uint64_t stable_fluids_context_required_elements(const StableFluidsContext* context) {
-    return context != nullptr && context->solver != nullptr ? context->solver->required_elements() : 0;
+int32_t stable_fluids_add_density_splat_async(
+    void* density,
+    uint64_t density_bytes,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
+    float cell_size,
+    float center_x,
+    float center_y,
+    float center_z,
+    float radius,
+    float amount,
+    void* cuda_stream) {
+    return stable_fluids_try([&] {
+        using namespace stable_fluids;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+            throw std::invalid_argument("grid dimensions must be positive");
+        }
+        if (cell_size <= 0.0f) {
+            throw std::invalid_argument("cell_size must be positive");
+        }
+        if (density == nullptr) {
+            throw std::invalid_argument("density must provide a non-null device pointer");
+        }
+        const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
+        if (density_bytes < compact_count * sizeof(float)) {
+            throw std::invalid_argument("density size_bytes is too small");
+        }
+
+        nvtx3::scoped_range range{"stable.add_density_splat"};
+        const auto params = stable_fluids::StepParams{1.0f / 60.0f, 0.0001f, 0.00005f, 20, 80, 8, 8, 8};
+        const dim3 block = make_block(params);
+        const dim3 grid = make_grid(nx, ny, nz, block);
+        splat_density_compact_kernel<<<grid, block, 0, to_stream(cuda_stream)>>>(
+            reinterpret_cast<float*>(density),
+            center_x,
+            center_y,
+            center_z,
+            fmaxf(radius, 1.0f),
+            amount,
+            nx,
+            ny,
+            nz);
+        check_cuda(cudaGetLastError(), "splat_density_compact_kernel launch");
+    });
 }
 
-uint64_t stable_fluids_context_required_scalar_field_bytes(const StableFluidsContext* context) {
-    return context != nullptr && context->solver != nullptr ? context->solver->required_scalar_field_bytes() : 0;
+int32_t stable_fluids_add_force_splat_async(
+    void* velocity_x,
+    uint64_t velocity_x_bytes,
+    void* velocity_y,
+    uint64_t velocity_y_bytes,
+    void* velocity_z,
+    uint64_t velocity_z_bytes,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
+    float cell_size,
+    float center_x,
+    float center_y,
+    float center_z,
+    float radius,
+    float force_x,
+    float force_y,
+    float force_z,
+    void* cuda_stream) {
+    return stable_fluids_try([&] {
+        using namespace stable_fluids;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+            throw std::invalid_argument("grid dimensions must be positive");
+        }
+        if (cell_size <= 0.0f) {
+            throw std::invalid_argument("cell_size must be positive");
+        }
+        const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
+        const auto compact_bytes = compact_count * sizeof(float);
+        const auto validate = [&](void* data, const std::uint64_t size_bytes, const char* name) {
+            if (data == nullptr) {
+                throw std::invalid_argument(std::string(name) + " must provide a non-null device pointer");
+            }
+            if (size_bytes < compact_bytes) {
+                throw std::invalid_argument(std::string(name) + " size_bytes is too small");
+            }
+        };
+        validate(velocity_x, velocity_x_bytes, "velocity_x");
+        validate(velocity_y, velocity_y_bytes, "velocity_y");
+        validate(velocity_z, velocity_z_bytes, "velocity_z");
+
+        nvtx3::scoped_range range{"stable.add_force_splat"};
+        const auto params = stable_fluids::StepParams{1.0f / 60.0f, 0.0001f, 0.00005f, 20, 80, 8, 8, 8};
+        const dim3 block = make_block(params);
+        const dim3 grid = make_grid(nx, ny, nz, block);
+        splat_force_compact_kernel<<<grid, block, 0, to_stream(cuda_stream)>>>(
+            reinterpret_cast<float*>(velocity_x),
+            reinterpret_cast<float*>(velocity_y),
+            reinterpret_cast<float*>(velocity_z),
+            center_x,
+            center_y,
+            center_z,
+            fmaxf(radius, 1.0f),
+            force_x,
+            force_y,
+            force_z,
+            nx,
+            ny,
+            nz);
+        check_cuda(cudaGetLastError(), "splat_force_compact_kernel launch");
+    });
 }
 
-uint64_t stable_fluids_context_required_vector_field_component_bytes(const StableFluidsContext* context, uint32_t component) {
-    return context != nullptr && context->solver != nullptr ? context->solver->required_vector_field_component_bytes(component) : 0;
+int32_t stable_fluids_step_async(
+    void* density,
+    uint64_t density_bytes,
+    void* velocity_x,
+    uint64_t velocity_x_bytes,
+    void* velocity_y,
+    uint64_t velocity_y_bytes,
+    void* velocity_z,
+    uint64_t velocity_z_bytes,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
+    float cell_size,
+    void* workspace,
+    uint64_t workspace_bytes,
+    float dt,
+    float viscosity,
+    float diffusion,
+    int32_t diffuse_iterations,
+    int32_t pressure_iterations,
+    int32_t block_x,
+    int32_t block_y,
+    int32_t block_z,
+    void* cuda_stream) {
+    return stable_fluids_try([&] {
+        using namespace stable_fluids;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+            throw std::invalid_argument("grid dimensions must be positive");
+        }
+        if (cell_size <= 0.0f) {
+            throw std::invalid_argument("cell_size must be positive");
+        }
+        const auto params = stable_fluids::StepParams{dt, viscosity, diffusion, diffuse_iterations, pressure_iterations, block_x, block_y, block_z};
+        if (params.dt <= 0.0f) {
+            throw std::invalid_argument("dt must be positive");
+        }
+        if (params.diffuse_iterations <= 0 || params.pressure_iterations <= 0) {
+            throw std::invalid_argument("iteration counts must be positive");
+        }
+
+        const auto interior_cell_count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+        const auto compact_bytes = interior_cell_count * sizeof(float);
+        const int nx_total = nx + 2;
+        const int ny_total = ny + 2;
+        const int nz_total = nz + 2;
+        const auto total_cell_count = static_cast<std::size_t>(nx_total) * static_cast<std::size_t>(ny_total) * static_cast<std::size_t>(nz_total);
+        const auto ghosted_bytes = total_cell_count * sizeof(float);
+
+        const auto validate_compact = [&](void* data, const std::uint64_t size_bytes, const char* name) {
+            if (data == nullptr) {
+                throw std::invalid_argument(std::string(name) + " must provide a non-null device pointer");
+            }
+            if (size_bytes < compact_bytes) {
+                throw std::invalid_argument(std::string(name) + " size_bytes is too small");
+            }
+        };
+        validate_compact(density, density_bytes, "density");
+        validate_compact(velocity_x, velocity_x_bytes, "velocity_x");
+        validate_compact(velocity_y, velocity_y_bytes, "velocity_y");
+        validate_compact(velocity_z, velocity_z_bytes, "velocity_z");
+        if (workspace == nullptr) {
+            throw std::invalid_argument("workspace must provide a non-null device pointer");
+        }
+        if (workspace_bytes < ghosted_bytes * 10ull) {
+            throw std::invalid_argument("workspace size_bytes is too small");
+        }
+
+        auto* cursor = reinterpret_cast<std::byte*>(workspace);
+        auto slice = [&]() {
+            auto* field = reinterpret_cast<float*>(cursor);
+            cursor += ghosted_bytes;
+            return field;
+        };
+        auto* density_g = slice();
+        auto* u_g = slice();
+        auto* v_g = slice();
+        auto* w_g = slice();
+        auto* density_prev = slice();
+        auto* u_prev = slice();
+        auto* v_prev = slice();
+        auto* w_prev = slice();
+        auto* pressure = slice();
+        auto* divergence = slice();
+        auto* density_compact = reinterpret_cast<float*>(density);
+        auto* u_compact = reinterpret_cast<float*>(velocity_x);
+        auto* v_compact = reinterpret_cast<float*>(velocity_y);
+        auto* w_compact = reinterpret_cast<float*>(velocity_z);
+        const dim3 block = make_block(params);
+        const auto stream = to_stream(cuda_stream);
+
+        auto fill_field = [&](float* field, const float value) {
+            constexpr int block_size = 256;
+            const int grid_size = static_cast<int>((total_cell_count + block_size - 1) / block_size);
+            fill_kernel<<<grid_size, block_size, 0, stream>>>(field, value, total_cell_count);
+            check_cuda(cudaGetLastError(), "fill_kernel launch");
+        };
+        auto copy_compact_to_ghosted = [&](float* ghosted, const float* compact) {
+            fill_field(ghosted, 0.0f);
+            constexpr int block_size = 256;
+            const int grid_size = static_cast<int>((interior_cell_count + block_size - 1) / block_size);
+            copy_compact_to_ghosted_kernel<<<grid_size, block_size, 0, stream>>>(ghosted, compact, nx, ny, nx_total, ny_total, interior_cell_count);
+            check_cuda(cudaGetLastError(), "copy_compact_to_ghosted_kernel launch");
+        };
+        auto copy_ghosted_to_compact = [&](float* compact, const float* ghosted) {
+            constexpr int block_size = 256;
+            const int grid_size = static_cast<int>((interior_cell_count + block_size - 1) / block_size);
+            copy_ghosted_to_compact_kernel<<<grid_size, block_size, 0, stream>>>(compact, ghosted, nx, ny, nx_total, ny_total, interior_cell_count);
+            check_cuda(cudaGetLastError(), "copy_ghosted_to_compact_kernel launch");
+        };
+        auto set_boundary = [&](const int field_kind, float* field) {
+            set_boundary_kernel<<<make_grid(nx_total, ny_total, nz_total, block), block, 0, stream>>>(field_kind, field, nx, ny, nz, nx_total, ny_total);
+            check_cuda(cudaGetLastError(), "set_boundary_kernel launch");
+        };
+        auto advect_scalar = [&](float* dst, const float* src, const float* u, const float* v, const float* w) {
+            const float dt_over_h = params.dt / cell_size;
+            advect_scalar_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(dst, src, u, v, w, dt_over_h, nx, ny, nz, nx_total, ny_total);
+            check_cuda(cudaGetLastError(), "advect_scalar_kernel launch");
+            set_boundary(0, dst);
+        };
+        auto advect_velocity = [&](float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src, const float* u_vel, const float* v_vel, const float* w_vel) {
+            const float dt_over_h = params.dt / cell_size;
+            advect_velocity_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(u_dst, v_dst, w_dst, u_src, v_src, w_src, u_vel, v_vel, w_vel, dt_over_h, nx, ny, nz, nx_total, ny_total);
+            check_cuda(cudaGetLastError(), "advect_velocity_kernel launch");
+            set_boundary(1, u_dst);
+            set_boundary(2, v_dst);
+            set_boundary(3, w_dst);
+        };
+        auto diffuse_scalar = [&](float* dst, const float* src) {
+            if (params.diffusion <= 0.0f) {
+                check_cuda(cudaMemcpyAsync(dst, src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse bypass");
+                set_boundary(0, dst);
+                return;
+            }
+            check_cuda(cudaMemcpyAsync(dst, src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync scalar diffuse init");
+            const float alpha = params.dt * params.diffusion / (cell_size * cell_size);
+            const float denom = 1.0f + 6.0f * alpha;
+            set_boundary(0, dst);
+            for (int iteration = 0; iteration < params.diffuse_iterations; ++iteration) {
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(dst, src, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
+                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar red launch");
+                set_boundary(0, dst);
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(dst, src, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
+                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel scalar black launch");
+                set_boundary(0, dst);
+            }
+        };
+        auto diffuse_velocity = [&](float* u_dst, float* v_dst, float* w_dst, const float* u_src, const float* v_src, const float* w_src) {
+            if (params.viscosity <= 0.0f) {
+                check_cuda(cudaMemcpyAsync(u_dst, u_src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse bypass");
+                check_cuda(cudaMemcpyAsync(v_dst, v_src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse bypass");
+                check_cuda(cudaMemcpyAsync(w_dst, w_src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse bypass");
+                set_boundary(1, u_dst);
+                set_boundary(2, v_dst);
+                set_boundary(3, w_dst);
+                return;
+            }
+            check_cuda(cudaMemcpyAsync(u_dst, u_src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync u diffuse init");
+            check_cuda(cudaMemcpyAsync(v_dst, v_src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync v diffuse init");
+            check_cuda(cudaMemcpyAsync(w_dst, w_src, ghosted_bytes, cudaMemcpyDeviceToDevice, stream), "cudaMemcpyAsync w diffuse init");
+            const float alpha = params.dt * params.viscosity / (cell_size * cell_size);
+            const float denom = 1.0f + 6.0f * alpha;
+            set_boundary(1, u_dst);
+            set_boundary(2, v_dst);
+            set_boundary(3, w_dst);
+            for (int iteration = 0; iteration < params.diffuse_iterations; ++iteration) {
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(u_dst, u_src, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(v_dst, v_src, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(w_dst, w_src, alpha, denom, 0, nx, ny, nz, nx_total, ny_total);
+                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity red launch");
+                set_boundary(1, u_dst);
+                set_boundary(2, v_dst);
+                set_boundary(3, w_dst);
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(u_dst, u_src, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(v_dst, v_src, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
+                rbgs_diffuse_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(w_dst, w_src, alpha, denom, 1, nx, ny, nz, nx_total, ny_total);
+                check_cuda(cudaGetLastError(), "rbgs_diffuse_kernel velocity black launch");
+                set_boundary(1, u_dst);
+                set_boundary(2, v_dst);
+                set_boundary(3, w_dst);
+            }
+        };
+        auto project = [&](float* u, float* v, float* w) {
+            nvtx3::scoped_range range{"stable.step.project"};
+            const float half_inv_h = 0.5f / cell_size;
+            const float h2 = cell_size * cell_size;
+            divergence_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(divergence, u, v, w, half_inv_h, nx, ny, nz, nx_total, ny_total);
+            check_cuda(cudaGetLastError(), "divergence_kernel launch");
+            set_boundary(0, divergence);
+            fill_field(pressure, 0.0f);
+            set_boundary(0, pressure);
+            for (int iteration = 0; iteration < params.pressure_iterations; ++iteration) {
+                rbgs_pressure_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(pressure, divergence, h2, 0, nx, ny, nz, nx_total, ny_total);
+                check_cuda(cudaGetLastError(), "rbgs_pressure_kernel red launch");
+                set_boundary(0, pressure);
+                rbgs_pressure_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(pressure, divergence, h2, 1, nx, ny, nz, nx_total, ny_total);
+                check_cuda(cudaGetLastError(), "rbgs_pressure_kernel black launch");
+                set_boundary(0, pressure);
+            }
+            set_boundary(0, pressure);
+            subtract_gradient_kernel<<<make_grid(nx, ny, nz, block), block, 0, stream>>>(u, v, w, pressure, half_inv_h, nx, ny, nz, nx_total, ny_total);
+            check_cuda(cudaGetLastError(), "subtract_gradient_kernel launch");
+            set_boundary(1, u);
+            set_boundary(2, v);
+            set_boundary(3, w);
+        };
+
+        nvtx3::scoped_range step_range{"stable.step"};
+        copy_compact_to_ghosted(density_g, density_compact);
+        copy_compact_to_ghosted(u_g, u_compact);
+        copy_compact_to_ghosted(v_g, v_compact);
+        copy_compact_to_ghosted(w_g, w_compact);
+        set_boundary(0, density_g);
+        set_boundary(1, u_g);
+        set_boundary(2, v_g);
+        set_boundary(3, w_g);
+        {
+            nvtx3::scoped_range range{"stable.step.advect_velocity"};
+            advect_velocity(u_prev, v_prev, w_prev, u_g, v_g, w_g, u_g, v_g, w_g);
+        }
+        {
+            nvtx3::scoped_range range{"stable.step.diffuse_velocity"};
+            diffuse_velocity(u_g, v_g, w_g, u_prev, v_prev, w_prev);
+        }
+        project(u_g, v_g, w_g);
+        {
+            nvtx3::scoped_range range{"stable.step.advect_density"};
+            advect_scalar(density_prev, density_g, u_g, v_g, w_g);
+        }
+        {
+            nvtx3::scoped_range range{"stable.step.diffuse_density"};
+            diffuse_scalar(density_g, density_prev);
+        }
+        copy_ghosted_to_compact(density_compact, density_g);
+        copy_ghosted_to_compact(u_compact, u_g);
+        copy_ghosted_to_compact(v_compact, v_g);
+        copy_ghosted_to_compact(w_compact, w_g);
+    });
 }
 
-int32_t stable_fluids_fields_clear_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_clear_async received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->zero_fields(*fields, to_stream(cuda_stream)); });
+int32_t stable_fluids_compute_velocity_magnitude_async(
+    void* velocity_x,
+    uint64_t velocity_x_bytes,
+    void* velocity_y,
+    uint64_t velocity_y_bytes,
+    void* velocity_z,
+    uint64_t velocity_z_bytes,
+    void* destination,
+    uint64_t destination_bytes,
+    int32_t nx,
+    int32_t ny,
+    int32_t nz,
+    float cell_size,
+    void* cuda_stream) {
+    return stable_fluids_try([&] {
+        using namespace stable_fluids;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+            throw std::invalid_argument("grid dimensions must be positive");
+        }
+        if (cell_size <= 0.0f) {
+            throw std::invalid_argument("cell_size must be positive");
+        }
+        const auto compact_count = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz);
+        const auto compact_bytes = compact_count * sizeof(float);
+        const auto validate = [&](void* data, const std::uint64_t size_bytes, const char* name) {
+            if (data == nullptr) {
+                throw std::invalid_argument(std::string(name) + " must provide a non-null device pointer");
+            }
+            if (size_bytes < compact_bytes) {
+                throw std::invalid_argument(std::string(name) + " size_bytes is too small");
+            }
+        };
+        validate(velocity_x, velocity_x_bytes, "velocity_x");
+        validate(velocity_y, velocity_y_bytes, "velocity_y");
+        validate(velocity_z, velocity_z_bytes, "velocity_z");
+        validate(destination, destination_bytes, "destination");
+
+        nvtx3::scoped_range range{"stable.snapshot_velocity_magnitude"};
+        constexpr int block_size = 256;
+        const int grid_size = static_cast<int>((compact_count + block_size - 1) / block_size);
+        velocity_magnitude_kernel<<<grid_size, block_size, 0, to_stream(cuda_stream)>>>(
+            reinterpret_cast<float*>(destination),
+            reinterpret_cast<const float*>(velocity_x),
+            reinterpret_cast<const float*>(velocity_y),
+            reinterpret_cast<const float*>(velocity_z),
+            compact_count);
+        check_cuda(cudaGetLastError(), "velocity_magnitude_kernel launch");
+    });
 }
 
-int32_t stable_fluids_fields_step_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_step_async received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->step(*fields, to_stream(cuda_stream)); });
-}
-
-int32_t stable_fluids_fields_add_density_splat_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const StableFluidsDensitySplatDesc* splat, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_density_splat_async received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->add_density_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->amount, to_stream(cuda_stream)); });
-}
-
-int32_t stable_fluids_fields_add_force_splat_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const StableFluidsForceSplatDesc* splat, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr || splat == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_add_force_splat_async received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->add_force_sphere(*fields, splat->center_x, splat->center_y, splat->center_z, splat->radius, splat->force_x, splat->force_y, splat->force_z, to_stream(cuda_stream)); });
-}
-
-int32_t stable_fluids_fields_snapshot_density_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const ScalarField* destination, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr || destination == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_snapshot_density_async received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->snapshot_density(*fields, *destination, to_stream(cuda_stream)); });
-}
-
-int32_t stable_fluids_fields_snapshot_velocity_magnitude_async(StableFluidsContext* context, const StableFluidsFieldSet* fields, const ScalarField* destination, void* cuda_stream) {
-    if (context == nullptr || context->solver == nullptr || fields == nullptr || destination == nullptr) {
-        return store_error(context, STABLE_FLUIDS_ERROR_INVALID_ARGUMENT, "stable_fluids_fields_snapshot_velocity_magnitude_async received a null argument");
-    }
-    return stable_fluids_try(context, [&] { context->solver->snapshot_velocity_magnitude(*fields, *destination, to_stream(cuda_stream)); });
-}
-
-uint64_t stable_fluids_last_error_length(void) {
-    return static_cast<uint64_t>(stable_fluids::g_last_error.size());
-}
-
-uint64_t stable_fluids_context_last_error_length(const StableFluidsContext* context) {
-    return context != nullptr ? static_cast<uint64_t>(context->last_error.size()) : static_cast<uint64_t>(stable_fluids::g_last_error.size());
-}
-
-int32_t stable_fluids_copy_last_error(char* buffer, uint64_t buffer_size) {
-    return copy_error_text(stable_fluids::g_last_error, buffer, buffer_size);
-}
-
-int32_t stable_fluids_copy_context_last_error(const StableFluidsContext* context, char* buffer, uint64_t buffer_size) {
-    return copy_error_text(context != nullptr ? context->last_error : stable_fluids::g_last_error, buffer, buffer_size);
+const char* stable_fluids_last_error(void) {
+    return stable_fluids::g_last_error.c_str();
 }
 
 } // extern "C"
