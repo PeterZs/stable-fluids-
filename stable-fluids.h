@@ -84,6 +84,7 @@ typedef struct StableFluidsStepDesc {
 
 STABLE_FLUIDS_API int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc);
 STABLE_FLUIDS_API int32_t stable_fluids_step_cpu(const StableFluidsStepDesc* desc);
+STABLE_FLUIDS_API int32_t stable_fluids_step_parallel(const StableFluidsStepDesc* desc);
 
 #ifdef __cplusplus
 }

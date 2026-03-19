@@ -129,6 +129,20 @@ int main() {
     std::vector<float> cpu_temporary_previous_velocity_z(vz_count, 0.0f);
     std::vector<float> cpu_temporary_pressure(scalar_count, 0.0f);
     std::vector<float> cpu_temporary_divergence(scalar_count, 0.0f);
+    std::vector<float> parallel_density(scalar_count, 0.0f);
+    std::vector<float> parallel_velocity_x(vx_count, 0.0f);
+    std::vector<float> parallel_velocity_y(vy_count, 0.0f);
+    std::vector<float> parallel_velocity_z(vz_count, 0.0f);
+    std::vector<float> parallel_temporary_density(scalar_count, 0.0f);
+    std::vector<float> parallel_temporary_velocity_x(vx_count, 0.0f);
+    std::vector<float> parallel_temporary_velocity_y(vy_count, 0.0f);
+    std::vector<float> parallel_temporary_velocity_z(vz_count, 0.0f);
+    std::vector<float> parallel_temporary_previous_density(scalar_count, 0.0f);
+    std::vector<float> parallel_temporary_previous_velocity_x(vx_count, 0.0f);
+    std::vector<float> parallel_temporary_previous_velocity_y(vy_count, 0.0f);
+    std::vector<float> parallel_temporary_previous_velocity_z(vz_count, 0.0f);
+    std::vector<float> parallel_temporary_pressure(scalar_count, 0.0f);
+    std::vector<float> parallel_temporary_divergence(scalar_count, 0.0f);
 
     auto add_source_cpu = [&](std::vector<float>& density, std::vector<float>& velocity_x, std::vector<float>& velocity_y, std::vector<float>& velocity_z, const float center_x, const float center_y, const float center_z, const float radius, const float density_amount, const float velocity_source_x,
                               const float velocity_source_y, const float velocity_source_z) {
@@ -224,6 +238,47 @@ int main() {
     const float cpu_total_density = std::accumulate(cpu_density.begin(), cpu_density.end(), 0.0f);
     const float cpu_peak_density  = cpu_density.empty() ? 0.0f : *std::max_element(cpu_density.begin(), cpu_density.end());
 
+    const auto parallel_begin = std::chrono::steady_clock::now();
+    for (int frame = 0; frame < frames; ++frame) {
+        if (frame < 8) add_source_cpu(parallel_density, parallel_velocity_x, parallel_velocity_y, parallel_velocity_z, static_cast<float>(nx) * 0.5f, static_cast<float>(ny) * 0.33f, static_cast<float>(nz) * 0.5f, frame == 0 ? 5.0f : 4.0f, frame == 0 ? 6.0f : 1.5f, frame == 0 ? 1.25f : 0.0f, frame == 0 ? 2.5f : 0.5f, frame == 0 ? 0.75f : 0.0f);
+
+        StableFluidsStepDesc parallel_desc{};
+        parallel_desc.struct_size                   = sizeof(StableFluidsStepDesc);
+        parallel_desc.api_version                   = 1;
+        parallel_desc.nx                            = nx;
+        parallel_desc.ny                            = ny;
+        parallel_desc.nz                            = nz;
+        parallel_desc.cell_size                     = cell_size;
+        parallel_desc.dt                            = dt;
+        parallel_desc.viscosity                     = viscosity;
+        parallel_desc.diffusion                     = diffusion;
+        parallel_desc.diffuse_iterations            = diffuse_iterations;
+        parallel_desc.pressure_iterations           = pressure_iterations;
+        parallel_desc.density                       = parallel_density.data();
+        parallel_desc.velocity_x                    = parallel_velocity_x.data();
+        parallel_desc.velocity_y                    = parallel_velocity_y.data();
+        parallel_desc.velocity_z                    = parallel_velocity_z.data();
+        parallel_desc.temporary_density             = parallel_temporary_density.data();
+        parallel_desc.temporary_velocity_x          = parallel_temporary_velocity_x.data();
+        parallel_desc.temporary_velocity_y          = parallel_temporary_velocity_y.data();
+        parallel_desc.temporary_velocity_z          = parallel_temporary_velocity_z.data();
+        parallel_desc.temporary_previous_density    = parallel_temporary_previous_density.data();
+        parallel_desc.temporary_previous_velocity_x = parallel_temporary_previous_velocity_x.data();
+        parallel_desc.temporary_previous_velocity_y = parallel_temporary_previous_velocity_y.data();
+        parallel_desc.temporary_previous_velocity_z = parallel_temporary_previous_velocity_z.data();
+        parallel_desc.temporary_pressure            = parallel_temporary_pressure.data();
+        parallel_desc.temporary_divergence          = parallel_temporary_divergence.data();
+        parallel_desc.block_x                       = block_x;
+        parallel_desc.block_y                       = block_y;
+        parallel_desc.block_z                       = block_z;
+        parallel_desc.stream                        = nullptr;
+        if (!stable_ok(stable_fluids_step_parallel(&parallel_desc), "stable_fluids_step_parallel")) return EXIT_FAILURE;
+    }
+    const auto parallel_end = std::chrono::steady_clock::now();
+
+    const float parallel_total_density = std::accumulate(parallel_density.begin(), parallel_density.end(), 0.0f);
+    const float parallel_peak_density  = parallel_density.empty() ? 0.0f : *std::max_element(parallel_density.begin(), parallel_density.end());
+
     float* density                       = nullptr;
     float* velocity_x                    = nullptr;
     float* velocity_y                    = nullptr;
@@ -318,9 +373,13 @@ int main() {
 
     const float cuda_total_density = exit_code == EXIT_SUCCESS ? std::accumulate(host_density.begin(), host_density.end(), 0.0f) : 0.0f;
     const float cuda_peak_density  = exit_code == EXIT_SUCCESS && !host_density.empty() ? *std::max_element(host_density.begin(), host_density.end()) : 0.0f;
-    float density_l1_diff          = 0.0f;
+    float parallel_density_l1_diff = 0.0f;
+    float cuda_density_l1_diff     = 0.0f;
     if (exit_code == EXIT_SUCCESS) {
-        for (std::size_t i = 0; i < scalar_count; ++i) density_l1_diff += std::abs(cpu_density[i] - host_density[i]);
+        for (std::size_t i = 0; i < scalar_count; ++i) {
+            parallel_density_l1_diff += std::abs(cpu_density[i] - parallel_density[i]);
+            cuda_density_l1_diff += std::abs(cpu_density[i] - host_density[i]);
+        }
     }
 
     cudaStreamDestroy(stream);
@@ -341,18 +400,19 @@ int main() {
     if (exit_code != EXIT_SUCCESS) return exit_code;
 
     const double cpu_ms = std::chrono::duration<double, std::milli>(cpu_end - cpu_begin).count();
+    const double parallel_ms = std::chrono::duration<double, std::milli>(parallel_end - parallel_begin).count();
     const double cuda_ms = std::chrono::duration<double, std::milli>(cuda_end - cuda_begin).count();
 
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "stable-fluids benchmark\n";
     std::cout << "grid: " << nx << " x " << ny << " x " << nz << '\n';
     std::cout << "frames: " << frames << '\n';
-    std::cout << "| metric | cpu | cuda | extra |\n";
-    std::cout << "|---|---:|---:|---:|\n";
-    std::cout << "| total_ms | " << cpu_ms << " | " << cuda_ms << " | " << (cuda_ms > 0.0 ? cpu_ms / cuda_ms : 0.0) << "x |\n";
-    std::cout << "| step_ms | " << cpu_ms / static_cast<double>(frames) << " | " << cuda_ms / static_cast<double>(frames) << " | " << (cuda_ms > 0.0 ? cpu_ms / cuda_ms : 0.0) << "x |\n";
-    std::cout << "| total_density | " << cpu_total_density << " | " << cuda_total_density << " | - |\n";
-    std::cout << "| peak_density | " << cpu_peak_density << " | " << cuda_peak_density << " | - |\n";
-    std::cout << "| density_l1_diff | - | - | " << density_l1_diff << " |\n";
+    std::cout << "| metric | cpu | parallel | cuda | extra |\n";
+    std::cout << "|---|---:|---:|---:|---:|\n";
+    std::cout << "| total_ms | " << cpu_ms << " | " << parallel_ms << " | " << cuda_ms << " | p=" << (parallel_ms > 0.0 ? cpu_ms / parallel_ms : 0.0) << "x, c=" << (cuda_ms > 0.0 ? cpu_ms / cuda_ms : 0.0) << "x |\n";
+    std::cout << "| step_ms | " << cpu_ms / static_cast<double>(frames) << " | " << parallel_ms / static_cast<double>(frames) << " | " << cuda_ms / static_cast<double>(frames) << " | p=" << (parallel_ms > 0.0 ? cpu_ms / parallel_ms : 0.0) << "x, c=" << (cuda_ms > 0.0 ? cpu_ms / cuda_ms : 0.0) << "x |\n";
+    std::cout << "| total_density | " << cpu_total_density << " | " << parallel_total_density << " | " << cuda_total_density << " | - |\n";
+    std::cout << "| peak_density | " << cpu_peak_density << " | " << parallel_peak_density << " | " << cuda_peak_density << " | - |\n";
+    std::cout << "| density_l1_diff_vs_cpu | 0.000 | " << parallel_density_l1_diff << " | " << cuda_density_l1_diff << " | - |\n";
     return EXIT_SUCCESS;
 }

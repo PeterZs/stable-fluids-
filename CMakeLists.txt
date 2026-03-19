@@ -29,6 +29,7 @@ add_library(
         stable-fluids.h
         backend-cuda.cu
         backend-cpu.cpp
+        backend-parallel.cpp
 )
 
 add_executable(
