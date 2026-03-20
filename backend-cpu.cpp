@@ -265,20 +265,20 @@ int32_t stable_fluids_step_cpu(const StableFluidsStepDesc* desc) {
     const int32_t diffuse_iterations = desc->diffuse_iterations;
     const int32_t pressure_iterations = desc->pressure_iterations;
 
-    auto* density_field = reinterpret_cast<float*>(desc->density);
-    auto* density_temporary = reinterpret_cast<float*>(desc->temporary_density);
-    auto* density_previous = reinterpret_cast<float*>(desc->temporary_previous_density);
-    auto* velocity_x_field = reinterpret_cast<float*>(desc->velocity_x);
-    auto* velocity_y_field = reinterpret_cast<float*>(desc->velocity_y);
-    auto* velocity_z_field = reinterpret_cast<float*>(desc->velocity_z);
-    auto* velocity_x_temporary = reinterpret_cast<float*>(desc->temporary_velocity_x);
-    auto* velocity_y_temporary = reinterpret_cast<float*>(desc->temporary_velocity_y);
-    auto* velocity_z_temporary = reinterpret_cast<float*>(desc->temporary_velocity_z);
-    auto* velocity_x_previous = reinterpret_cast<float*>(desc->temporary_previous_velocity_x);
-    auto* velocity_y_previous = reinterpret_cast<float*>(desc->temporary_previous_velocity_y);
-    auto* velocity_z_previous = reinterpret_cast<float*>(desc->temporary_previous_velocity_z);
-    auto* pressure = reinterpret_cast<float*>(desc->temporary_pressure);
-    auto* divergence = reinterpret_cast<float*>(desc->temporary_divergence);
+    auto* density_field = static_cast<float*>(desc->density);
+    auto* density_temporary = static_cast<float*>(desc->temporary_density);
+    auto* density_previous = static_cast<float*>(desc->temporary_previous_density);
+    auto* velocity_x_field = static_cast<float*>(desc->velocity_x);
+    auto* velocity_y_field = static_cast<float*>(desc->velocity_y);
+    auto* velocity_z_field = static_cast<float*>(desc->velocity_z);
+    auto* velocity_x_temporary = static_cast<float*>(desc->temporary_velocity_x);
+    auto* velocity_y_temporary = static_cast<float*>(desc->temporary_velocity_y);
+    auto* velocity_z_temporary = static_cast<float*>(desc->temporary_velocity_z);
+    auto* velocity_x_previous = static_cast<float*>(desc->temporary_previous_velocity_x);
+    auto* velocity_y_previous = static_cast<float*>(desc->temporary_previous_velocity_y);
+    auto* velocity_z_previous = static_cast<float*>(desc->temporary_previous_velocity_z);
+    auto* pressure = static_cast<float*>(desc->temporary_pressure);
+    auto* divergence = static_cast<float*>(desc->temporary_divergence);
 
     const std::uint64_t cell_bytes = static_cast<std::uint64_t>(nx) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
     const std::uint64_t velocity_x_field_bytes = static_cast<std::uint64_t>(nx + 1) * static_cast<std::uint64_t>(ny) * static_cast<std::uint64_t>(nz) * sizeof(float);
