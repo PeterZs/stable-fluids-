@@ -43,9 +43,6 @@ Error code scheme:
 2014  : invalid temporary previous velocity_z buffer
 2015  : invalid temporary pressure buffer
 2016  : invalid temporary divergence buffer
-3xxx  : backend binding errors
-3002  : CPU backend requires stream == nullptr
-3003  : CUDA backend requires stream != nullptr
 5xxx  : CUDA runtime or kernel launch failure
 5001  : CUDA call failed
 */
@@ -82,6 +79,7 @@ typedef struct StableFluidsStepDesc {
     void* stream;
 } StableFluidsStepDesc;
 
+STABLE_FLUIDS_API int32_t stable_fluids_validate_desc(const StableFluidsStepDesc* desc);
 STABLE_FLUIDS_API int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc);
 STABLE_FLUIDS_API int32_t stable_fluids_step_cpu(const StableFluidsStepDesc* desc);
 STABLE_FLUIDS_API int32_t stable_fluids_step_parallel(const StableFluidsStepDesc* desc);

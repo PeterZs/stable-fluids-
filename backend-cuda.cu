@@ -258,32 +258,13 @@ namespace {
 
 extern "C" {
 
-int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc) {
-    using namespace stable_fluids;
+int32_t stable_fluids_validate_desc(const StableFluidsStepDesc* desc) {
     if (desc == nullptr) return 1000;
     if (desc->struct_size < sizeof(StableFluidsStepDesc)) return 1000;
-    if (desc->stream == nullptr) return 3003;
-    const int32_t nx = desc->nx;
-    const int32_t ny = desc->ny;
-    const int32_t nz = desc->nz;
-    const float cell_size = desc->cell_size;
-    const float dt = desc->dt;
-    const float viscosity = desc->viscosity;
-    const float diffusion = desc->diffusion;
-    const int32_t diffuse_iterations = desc->diffuse_iterations;
-    const int32_t pressure_iterations = desc->pressure_iterations;
-    const int32_t block_x = desc->block_x;
-    const int32_t block_y = desc->block_y;
-    const int32_t block_z = desc->block_z;
-    if (nx <= 0 || ny <= 0 || nz <= 0) return 1001;
-    if (cell_size <= 0.0f) return 1002;
-    if (dt <= 0.0f) return 1003;
-    if (diffuse_iterations <= 0 || pressure_iterations <= 0) return 1004;
-
-    const auto cell_bytes = scalar_bytes(nx, ny, nz);
-    const auto velocity_x_field_bytes = velocity_x_bytes(nx, ny, nz);
-    const auto velocity_y_field_bytes = velocity_y_bytes(nx, ny, nz);
-    const auto velocity_z_field_bytes = velocity_z_bytes(nx, ny, nz);
+    if (desc->nx <= 0 || desc->ny <= 0 || desc->nz <= 0) return 1001;
+    if (desc->cell_size <= 0.0f) return 1002;
+    if (desc->dt <= 0.0f) return 1003;
+    if (desc->diffuse_iterations <= 0 || desc->pressure_iterations <= 0) return 1004;
     if (desc->density == nullptr) return 2001;
     if (desc->velocity_x == nullptr) return 2003;
     if (desc->velocity_y == nullptr) return 2004;
@@ -298,6 +279,28 @@ int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc) {
     if (desc->temporary_previous_velocity_z == nullptr) return 2014;
     if (desc->temporary_pressure == nullptr) return 2015;
     if (desc->temporary_divergence == nullptr) return 2016;
+    return 0;
+}
+
+int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc) {
+    using namespace stable_fluids;
+    const int32_t nx = desc->nx;
+    const int32_t ny = desc->ny;
+    const int32_t nz = desc->nz;
+    const float cell_size = desc->cell_size;
+    const float dt = desc->dt;
+    const float viscosity = desc->viscosity;
+    const float diffusion = desc->diffusion;
+    const int32_t diffuse_iterations = desc->diffuse_iterations;
+    const int32_t pressure_iterations = desc->pressure_iterations;
+    const int32_t block_x = desc->block_x;
+    const int32_t block_y = desc->block_y;
+    const int32_t block_z = desc->block_z;
+
+    const auto cell_bytes = scalar_bytes(nx, ny, nz);
+    const auto velocity_x_field_bytes = velocity_x_bytes(nx, ny, nz);
+    const auto velocity_y_field_bytes = velocity_y_bytes(nx, ny, nz);
+    const auto velocity_z_field_bytes = velocity_z_bytes(nx, ny, nz);
 
     auto* density_field = reinterpret_cast<float*>(desc->density);
     auto* density_temporary = reinterpret_cast<float*>(desc->temporary_density);
