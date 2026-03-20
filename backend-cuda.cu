@@ -248,14 +248,6 @@ namespace stable_fluids {
 
 } // namespace stable_fluids
 
-namespace {
-
-    stable_fluids::Stream to_stream(void* cuda_stream) noexcept {
-        return reinterpret_cast<stable_fluids::Stream>(cuda_stream);
-    }
-
-} // namespace
-
 extern "C" {
 
 int32_t stable_fluids_validate_desc(const StableFluidsStepDesc* desc) {
@@ -321,7 +313,7 @@ int32_t stable_fluids_step_cuda(const StableFluidsStepDesc* desc) {
     const dim3 u_grid = make_grid(nx + 1, ny, nz, block);
     const dim3 v_grid = make_grid(nx, ny + 1, nz, block);
     const dim3 w_grid = make_grid(nx, ny, nz + 1, block);
-    const auto stream = to_stream(desc->stream);
+    const auto stream = reinterpret_cast<stable_fluids::Stream>(desc->stream);
 
     nvtx3::scoped_range step_range{"stable.step"};
     {
