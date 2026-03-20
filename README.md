@@ -2,54 +2,73 @@
 
 ## Pipeline Overview
 
-One step of this implementation is
+In the paper, the velocity update is written as
 
 $$
-\mathbf{u}^n \rightarrow \text{advect} \rightarrow \text{diffuse} \rightarrow \text{project} \rightarrow \mathbf{u}^{n+1},
+\frac{\partial \mathbf{u}}{\partial t} = \mathbf{P}\left( -(\mathbf{u} \cdot \nabla)\mathbf{u} + \nu \nabla^2 \mathbf{u} + \mathbf{f} \right),
 $$
 
-then
+where $\mathbf{P}$ is the projection onto divergence-free fields.
+
+The paper then splits one step into
 
 $$
-\rho^n \rightarrow \text{advect by } \mathbf{u}^{n+1} \rightarrow \text{diffuse} \rightarrow \rho^{n+1}.
+\mathbf{w}_0 \rightarrow \mathbf{w}_1 \rightarrow \mathbf{w}_2 \rightarrow \mathbf{w}_3 \rightarrow \mathbf{w}_4,
 $$
 
-Fields:
+with
+
+1. add force,
+2. advect,
+3. diffuse,
+4. project.
+
+This repository uses the same split, except that the force step is done outside `stable_fluids_step_cuda`. The CUDA step therefore performs
+
+$$
+\mathbf{w}_1 \rightarrow \mathbf{w}_2 \rightarrow \mathbf{w}_3 \rightarrow \mathbf{w}_4,
+$$
+
+followed by the same advection-diffusion split for the scalar density field.
+
+Field layout:
 
 - `density`: `(nx, ny, nz)`
 - `velocity_x`: `(nx + 1, ny, nz)`
 - `velocity_y`: `(nx, ny + 1, nz)`
 - `velocity_z`: `(nx, ny, nz + 1)`
 
-The velocity layout is MAC staggered. Density is cell-centered.
-
 ## Method Details
 
-### 1. Sampling
+### 1. Advection
 
 #### Theory
 
-Stable Fluids uses semi-Lagrangian advection. For a quantity $q$,
+The paper resolves the non-linear term
 
 $$
-\frac{\partial q}{\partial t} + \mathbf{u} \cdot \nabla q = 0
+-(\mathbf{u} \cdot \nabla)\mathbf{u}
 $$
 
-is updated by backward tracing:
+with the method of characteristics. For a quantity $a(\mathbf{x}, t)$,
 
 $$
-q^{n+1}(\mathbf{x}) = q^n(\mathbf{x} - \Delta t \, \mathbf{u}(\mathbf{x})).
+\frac{\partial a}{\partial t} = - \mathbf{u} \cdot \nabla a
 $$
 
-This implementation samples in grid-index coordinates, so the traced point is
+is solved by tracing backward:
 
 $$
-\mathbf{x}_d = \mathbf{x} - \frac{\Delta t}{h} \mathbf{u}(\mathbf{x}),
+a(\mathbf{x}, t + \Delta t) = a(\mathbf{p}(\mathbf{x}, -\Delta t), t).
 $$
 
-where $h$ is `cell_size`.
+In this implementation, all samples are taken in grid-index coordinates. If $h$ is the cell size, the traced point is
 
-Scalar sampling uses trilinear interpolation on the cell-centered grid. Velocity sampling reconstructs a collocated vector from the staggered MAC components:
+$$
+\mathbf{x}_d = \mathbf{x} - \frac{\Delta t}{h}\mathbf{u}(\mathbf{x}).
+$$
+
+Velocity is stored on a MAC grid, so the full vector field is reconstructed by
 
 $$
 \mathbf{u}(x,y,z) =
@@ -63,15 +82,6 @@ $$
 #### CUDA Implementation
 
 ```cpp
-__device__ std::size_t index_3d(const int i, const int j, const int k, const int nx, const int ny) {
-    return static_cast<std::size_t>((k * ny + j) * nx + i);
-}
-
-__device__ float fetch_clamped(
-    const float* const field, const int i, const int j, const int k, const int nx, const int ny, const int nz) {
-    return field[index_3d(clampi(i, 0, nx - 1), clampi(j, 0, ny - 1), clampi(k, 0, nz - 1), nx, ny)];
-}
-
 __device__ float sample_grid(
     const float* const field, const float x, const float y, const float z, const int nx, const int ny, const int nz) {
     const float px = clampf(x, 0.0f, static_cast<float>(nx - 1));
@@ -103,22 +113,6 @@ __device__ float sample_grid(
     return c0 + (c1 - c0) * tz;
 }
 
-__device__ float sample_scalar(const float* const field, const float x, const float y, const float z, const int nx, const int ny, const int nz) {
-    return sample_grid(field, x, y, z, nx, ny, nz);
-}
-
-__device__ float sample_u(const float* const field, const float x, const float y, const float z, const int nx, const int ny, const int nz) {
-    return sample_grid(field, x, y, z, nx + 1, ny, nz);
-}
-
-__device__ float sample_v(const float* const field, const float x, const float y, const float z, const int nx, const int ny, const int nz) {
-    return sample_grid(field, x, y, z, nx, ny + 1, nz);
-}
-
-__device__ float sample_w(const float* const field, const float x, const float y, const float z, const int nx, const int ny, const int nz) {
-    return sample_grid(field, x, y, z, nx, ny, nz + 1);
-}
-
 __device__ float3 sample_velocity(
     const float* const u, const float* const v, const float* const w, const float3 p, const int nx, const int ny, const int nz) {
     return make_float3(
@@ -126,97 +120,7 @@ __device__ float3 sample_velocity(
         sample_v(v, p.x - 0.5f, p.y, p.z - 0.5f, nx, ny, nz),
         sample_w(w, p.x - 0.5f, p.y - 0.5f, p.z, nx, ny, nz));
 }
-```
 
-This code implements:
-
-- x-fastest linear indexing,
-- clamped trilinear interpolation,
-- MAC-to-collocated velocity reconstruction.
-
-### 2. Boundary Conditions
-
-#### Theory
-
-The wall condition is zero normal velocity on the domain boundary:
-
-- $u = 0$ on the two $x$ walls,
-- $v = 0$ on the two $y$ walls,
-- $w = 0$ on the two $z$ walls.
-
-#### CUDA Implementation
-
-```cpp
-__global__ void set_u_boundary_kernel(float* const u, const int nx, const int ny, const int nz) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int j = blockIdx.y * blockDim.y + threadIdx.y;
-    const int k = blockIdx.z * blockDim.z + threadIdx.z;
-    if (i > nx || j >= ny || k >= nz) return;
-    if (i == 0 || i == nx) u[index_3d(i, j, k, nx + 1, ny)] = 0.0f;
-}
-
-__global__ void set_v_boundary_kernel(float* const v, const int nx, const int ny, const int nz) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int j = blockIdx.y * blockDim.y + threadIdx.y;
-    const int k = blockIdx.z * blockDim.z + threadIdx.z;
-    if (i >= nx || j > ny || k >= nz) return;
-    if (j == 0 || j == ny) v[index_3d(i, j, k, nx, ny + 1)] = 0.0f;
-}
-
-__global__ void set_w_boundary_kernel(float* const w, const int nx, const int ny, const int nz) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int j = blockIdx.y * blockDim.y + threadIdx.y;
-    const int k = blockIdx.z * blockDim.z + threadIdx.z;
-    if (i >= nx || j >= ny || k > nz) return;
-    if (k == 0 || k == nz) w[index_3d(i, j, k, nx, ny)] = 0.0f;
-}
-```
-
-Each kernel enforces one normal component.
-
-### 3. Velocity Advection
-
-#### Theory
-
-Velocity advection solves
-
-$$
-\frac{\partial \mathbf{u}}{\partial t} + (\mathbf{u} \cdot \nabla)\mathbf{u} = 0
-$$
-
-with semi-Lagrangian backtracing.
-
-For the x-face component, the geometric sample point is
-
-$$
-\mathbf{x}_u = (i, j + 0.5, k + 0.5).
-$$
-
-Then
-
-$$
-\mathbf{x}_d = \mathbf{x}_u - \frac{\Delta t}{h} \mathbf{u}(\mathbf{x}_u),
-$$
-
-and the new x-face value is
-
-$$
-u^*(i,j,k) = u^n(\mathbf{x}_d).
-$$
-
-The y-face and z-face updates are the same, but centered at
-
-$$
-\mathbf{x}_v = (i + 0.5, j, k + 0.5),
-$$
-
-$$
-\mathbf{x}_w = (i + 0.5, j + 0.5, k).
-$$
-
-#### CUDA Implementation
-
-```cpp
 __global__ void advect_u_kernel(float* const dst, const float* const src, const float* const u, const float* const v, const float* const w, const int nx, const int ny, const int nz, const float dt_over_h) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -251,37 +155,38 @@ __global__ void advect_w_kernel(float* const dst, const float* const src, const 
 }
 ```
 
-The step routine uses these kernels in this order:
+The step routine first copies the current velocity field into the previous-velocity buffers, then advects into the temporary-velocity buffers. In the paper's notation, this is the transition
 
-1. copy current velocity to the `temporary_previous_velocity_*` fields,
-2. advect into `temporary_velocity_*`,
-3. apply the three boundary kernels to `temporary_velocity_*`.
+$$
+\mathbf{w}_1 \rightarrow \mathbf{w}_2.
+$$
 
-### 4. Velocity Diffusion
+### 2. Diffusion
 
 #### Theory
 
-Velocity diffusion solves
+The paper writes the diffusion step as
 
 $$
-\frac{\partial \mathbf{u}}{\partial t} = \nu \nabla^2 \mathbf{u}.
+\frac{\partial \mathbf{w}_2}{\partial t} = \nu \nabla^2 \mathbf{w}_2.
 $$
 
 Backward Euler gives
 
 $$
-(I - \nu \Delta t \nabla^2)\mathbf{u}^{n+1} = \mathbf{u}^*.
+(I - \nu \Delta t \nabla^2)\mathbf{w}_3 = \mathbf{w}_2.
 $$
 
-With the 7-point stencil, one relaxation update is
+On a regular grid, one red-black Gauss-Seidel update is
 
 $$
 q_{i,j,k}^{m+1} =
 \frac{
-q^*_{i,j,k} + a \left(
-q_{i-1,j,k}^m + q_{i+1,j,k}^m +
-q_{i,j-1,k}^m + q_{i,j+1,k}^m +
-q_{i,j,k-1}^m + q_{i,j,k+1}^m
+q_{i,j,k}^{*}
++ a \left(
+q_{i-1,j,k}^{m} + q_{i+1,j,k}^{m}
++ q_{i,j-1,k}^{m} + q_{i,j+1,k}^{m}
++ q_{i,j,k-1}^{m} + q_{i,j,k+1}^{m}
 \right)
 }{
 1 + 6a
@@ -293,8 +198,6 @@ where
 $$
 a = \frac{\nu \Delta t}{h^2}.
 $$
-
-The implementation uses red-black Gauss-Seidel.
 
 #### CUDA Implementation
 
@@ -313,81 +216,66 @@ __global__ void diffuse_grid_kernel(float* const dst, const float* const src, co
 }
 ```
 
-The step routine uses it as follows:
+The CUDA step:
 
-1. if `viscosity <= 0`, copy `temporary_velocity_*` to `velocity_*`,
-2. otherwise copy `temporary_velocity_*` to `velocity_*`,
-3. set `alpha = dt * viscosity / (cell_size * cell_size)`,
-4. set `denom = 1 + 6 * alpha`,
-5. run `diffuse_iterations` times:
-   - parity 0 on x, y, z velocity,
-   - apply x, y, z boundary kernels,
-   - parity 1 on x, y, z velocity,
-   - apply x, y, z boundary kernels.
+1. copies `temporary_velocity_*` into `velocity_*`,
+2. sets `alpha = dt * viscosity / (cell_size * cell_size)`,
+3. sets `denom = 1 + 6 * alpha`,
+4. applies parity `0` then parity `1`,
+5. reapplies velocity boundary conditions after each sweep.
 
-Here:
+This is the paper's transition
 
-- `src` is the fixed advected velocity in `temporary_velocity_*`,
-- `dst` is the evolving iterate in `velocity_*`.
+$$
+\mathbf{w}_2 \rightarrow \mathbf{w}_3.
+$$
 
-### 5. Projection
+### 3. Projection
 
 #### Theory
 
-Projection solves
+The paper defines the projection by
 
 $$
-\mathbf{w} = \mathbf{u} + \nabla p,
+\mathbf{w} = \mathbf{u} + \nabla q,
 $$
 
-with
+where $\mathbf{u}$ has zero divergence. Applying divergence gives the Poisson equation
 
 $$
-\nabla \cdot \mathbf{u} = 0.
+\nabla^2 q = \nabla \cdot \mathbf{w}.
 $$
 
-So $p$ satisfies
+The projected field is then
 
 $$
-\nabla^2 p = \nabla \cdot \mathbf{w}.
+\mathbf{u} = \mathbf{P}\mathbf{w} = \mathbf{w} - \nabla q.
 $$
 
-The MAC divergence is
+For the MAC layout used here,
 
 $$
 d_{i,j,k} =
 \frac{
-u_{i+1,j,k} - u_{i,j,k} +
-v_{i,j+1,k} - v_{i,j,k} +
-w_{i,j,k+1} - w_{i,j,k}
+u_{i+1,j,k} - u_{i,j,k}
++ v_{i,j+1,k} - v_{i,j,k}
++ w_{i,j,k+1} - w_{i,j,k}
 }{h}.
 $$
 
-The pressure relaxation step is
+The pressure update is
 
 $$
-p_{i,j,k}^{m+1} =
+q_{i,j,k}^{m+1} =
 \frac{
-p_{i-1,j,k} + p_{i+1,j,k} +
-p_{i,j-1,k} + p_{i,j+1,k} +
-p_{i,j,k-1} + p_{i,j,k+1}
+q_{i-1,j,k} + q_{i+1,j,k}
++ q_{i,j-1,k} + q_{i,j+1,k}
++ q_{i,j,k-1} + q_{i,j,k+1}
 - h^2 d_{i,j,k}
 }{6}.
 $$
 
-Then subtract the pressure gradient:
-
-$$
-u_{i,j,k} \leftarrow u_{i,j,k} - \frac{p_{i,j,k} - p_{i-1,j,k}}{h},
-$$
-
-$$
-v_{i,j,k} \leftarrow v_{i,j,k} - \frac{p_{i,j,k} - p_{i,j-1,k}}{h},
-$$
-
-$$
-w_{i,j,k} \leftarrow w_{i,j,k} - \frac{p_{i,j,k} - p_{i,j,k-1}}{h}.
-$$
+Then subtract the gradient componentwise.
 
 #### CUDA Implementation
 
@@ -447,40 +335,40 @@ __global__ void subtract_gradient_w_kernel(float* const w, const float* const pr
 }
 ```
 
-The step routine applies them in this order:
+The CUDA step:
 
-1. zero `temporary_pressure`,
-2. compute `temporary_divergence`,
-3. run `pressure_iterations` red-black pressure sweeps,
-4. subtract the pressure gradient from `velocity_x`, `velocity_y`, `velocity_z`,
-5. apply boundary kernels again.
+1. zeros `temporary_pressure`,
+2. computes `temporary_divergence`,
+3. runs `pressure_iterations` red-black sweeps,
+4. subtracts the pressure gradient from `velocity_x`, `velocity_y`, `velocity_z`,
+5. reapplies the boundary kernels.
 
-### 6. Density Advection
+This is the paper's transition
+
+$$
+\mathbf{w}_3 \rightarrow \mathbf{w}_4.
+$$
+
+### 4. Density Advection
 
 #### Theory
 
-Density advection solves
+For a scalar quantity $a$, the paper writes
 
 $$
-\frac{\partial \rho}{\partial t} + \mathbf{u} \cdot \nabla \rho = 0
+\frac{\partial a}{\partial t} = - \mathbf{u} \cdot \nabla a + \kappa_a \nabla^2 a - \alpha_a a + S_a.
 $$
 
-with the projected velocity field. At the cell center
+This implementation uses only the advection-diffusion part for density. The advection substep is
 
 $$
-\mathbf{x}_\rho = (i + 0.5, j + 0.5, k + 0.5),
+\frac{\partial \rho}{\partial t} = - \mathbf{u} \cdot \nabla \rho,
 $$
 
-the backtraced point is
+so
 
 $$
-\mathbf{x}_d = \mathbf{x}_\rho - \frac{\Delta t}{h} \mathbf{u}(\mathbf{x}_\rho),
-$$
-
-and the update is
-
-$$
-\rho^*(i,j,k) = \rho^n(\mathbf{x}_d).
+\rho^{*}(\mathbf{x}, t + \Delta t) = \rho(\mathbf{p}(\mathbf{x}, -\Delta t), t).
 $$
 
 #### CUDA Implementation
@@ -498,28 +386,25 @@ __global__ void advect_scalar_kernel(float* const dst, const float* const src, c
 }
 ```
 
-The step routine does:
+The CUDA step copies `density` into `temporary_previous_density`, then advects into `temporary_density`.
 
-1. copy `density` to `temporary_previous_density`,
-2. advect from `temporary_previous_density` into `temporary_density`.
-
-### 7. Density Diffusion
+### 5. Density Diffusion
 
 #### Theory
 
-Density diffusion solves
+The diffusion part of the scalar equation is
 
 $$
-\frac{\partial \rho}{\partial t} = \kappa \nabla^2 \rho
+\frac{\partial \rho}{\partial t} = \kappa \nabla^2 \rho.
 $$
 
-with backward Euler:
+Backward Euler gives
 
 $$
-(I - \kappa \Delta t \nabla^2)\rho^{n+1} = \rho^*.
+(I - \kappa \Delta t \nabla^2)\rho^{n+1} = \rho^{*}.
 $$
 
-The relaxation formula is the same as velocity diffusion, with
+The discrete relaxation formula is the same as for velocity, with
 
 $$
 a = \frac{\kappa \Delta t}{h^2}.
@@ -527,54 +412,23 @@ $$
 
 #### CUDA Implementation
 
-The same `diffuse_grid_kernel` is reused. The step routine does:
+The same `diffuse_grid_kernel` is reused for density.
 
-1. if `diffusion <= 0`, copy `temporary_density` to `density`,
-2. otherwise copy `temporary_density` to `density`,
-3. set `alpha = dt * diffusion / (cell_size * cell_size)`,
-4. set `denom = 1 + 6 * alpha`,
-5. run `diffuse_iterations` red-black sweeps on `density`, using `temporary_density` as the fixed source.
+The CUDA step:
 
-### 8. Step Order
-
-#### Theory
-
-The implemented operator sequence is
-
-$$
-\text{advect velocity}
-\rightarrow
-\text{diffuse velocity}
-\rightarrow
-\text{project}
-\rightarrow
-\text{advect density}
-\rightarrow
-\text{diffuse density}.
-$$
-
-#### CUDA Implementation
-
-`stable_fluids_step_cuda` executes exactly:
-
-1. copy current velocity to previous velocity buffers,
-2. advect velocity to temporary velocity buffers,
-3. apply velocity boundary kernels,
-4. diffuse velocity into the persistent velocity buffers,
-5. project the persistent velocity buffers,
-6. copy current density to previous density buffer,
-7. advect density to temporary density buffer,
-8. diffuse density into the persistent density buffer.
+1. copies `temporary_density` into `density`,
+2. sets `alpha = dt * diffusion / (cell_size * cell_size)`,
+3. sets `denom = 1 + 6 * alpha`,
+4. runs `diffuse_iterations` red-black sweeps on `density`, using `temporary_density` as the fixed right-hand side.
 
 ## Reproduction Checklist
 
-To reproduce this CUDA implementation, implement:
+To reproduce this CUDA implementation faithfully, keep the paper's split and the code's buffer flow:
 
-1. MAC staggered velocity storage,
-2. trilinear interpolation on scalar and face grids,
-3. collocated velocity reconstruction from MAC components,
-4. semi-Lagrangian advection for `u`, `v`, `w`, and `density`,
-5. red-black Gauss-Seidel diffusion,
-6. MAC divergence, Poisson pressure solve, and pressure-gradient subtraction,
-7. zero normal velocity boundary kernels,
-8. the exact stage order given above.
+1. external force is applied outside `stable_fluids_step_cuda`,
+2. `stable_fluids_step_cuda` performs advection, diffusion, and projection on velocity,
+3. then advection and diffusion on density,
+4. all advection uses backward characteristic tracing,
+5. all diffusion and projection solves use red-black Gauss-Seidel,
+6. all velocity operators use the MAC staggered layout,
+7. wall conditions set the normal velocity component to zero.
